@@ -141,6 +141,27 @@ def test_t_formats_placeholders():
     assert "3" in msg
 
 
+def test_home_channel_notice_is_localized():
+    """主通道首次引导必须使用 catalog，供消息平台按语言设置呈现。"""
+    en = i18n.t("gateway.home_channel_notice", lang="en", sethome_cmd="/sethome")
+    zh = i18n.t("gateway.home_channel_notice", lang="zh", sethome_cmd="/sethome")
+    assert "No home channel" in en
+    assert "尚未为当前通道设置主会话" in zh
+    assert "/sethome" in en and "/sethome" in zh
+
+
+def test_pairing_code_notice_is_localized():
+    zh = i18n.t(
+        "gateway.pairing_code_notice",
+        lang="zh",
+        code="JWK7BGMG",
+        approval_instruction="请在 HLMate 中批准。",
+    )
+    assert "暂未获得使用授权" in zh
+    assert "JWK7BGMG" in zh
+    assert "请在 HLMate 中批准" in zh
+
+
 def test_t_missing_key_returns_key():
     """A missing key returns its own path -- ugly but never crashes."""
     result = i18n.t("nonexistent.key.path", lang="en")

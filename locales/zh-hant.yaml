@@ -20,6 +20,10 @@ approval:
   blocklist_message: "此指令位於無條件封鎖清單中，無法被批准。"
 
 gateway:
+  pairing_code_notice: "你好，我尚未獲得使用授權。\n\n你的配對碼：`{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "請讓機器人管理員執行：\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "目前配對請求過多，請稍後再試。"
+  home_channel_notice: "📬 尚未為目前頻道設定主頻道。主頻道用於接收排程工作結果和跨平台訊息。\n\n輸入 {sethome_cmd} 可將目前聊天設為主頻道；如暫不需要，可忽略此提示。"
   approval_expired: "⚠️ 批准已逾期（代理不再等待）。請讓代理重試。"
   draining:         "⏳ 正在等待 {count} 個活躍代理結束後重新啟動..."
   goal_cleared:     "✓ 目標已清除。"

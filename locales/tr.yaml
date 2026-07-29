@@ -20,6 +20,10 @@ approval:
   blocklist_message: "Bu komut koşulsuz engelleme listesinde ve onaylanamaz."
 
 gateway:
+  pairing_code_notice: "Merhaba, sizi henüz tanımıyorum.\n\nEşleştirme kodunuz: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "Bot sahibinden şunu çalıştırmasını isteyin:\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "Şu anda çok fazla eşleştirme isteği var. Lütfen daha sonra tekrar deneyin."
+  home_channel_notice: "📬 Bu platform için bir ana kanal ayarlanmamış. Hermes zamanlanmış iş sonuçlarını ve platformlar arası mesajları bu kanala iletir.\n\nBu sohbeti ana kanal yapmak için {sethome_cmd} yazın veya bu bildirimi yok sayın."
   approval_expired: "⚠️ Onay süresi doldu (ajan artık beklemiyor). Ajanın tekrar denemesini isteyin."
   draining:         "⏳ Yeniden başlatmadan önce {count} aktif ajan bekleniyor..."
   goal_cleared:     "✓ Hedef temizlendi."

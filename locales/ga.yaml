@@ -24,6 +24,10 @@ approval:
   blocklist_message: "Tá an t-ordú seo ar an liosta cosc gan choinníoll agus ní féidir é a cheadú."
 
 gateway:
+  pairing_code_notice: "Dia duit, ní aithnímid thú fós.\n\nDo chód péireála: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "Iarr ar úinéir an bhota an méid seo a leanas a rith:\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "Tá an iomarca iarratas péireála ann faoi láthair. Bain triail eile as níos déanaí."
+  home_channel_notice: "📬 Níl aon chainéal baile socraithe don ardán seo. Seachadann Hermes torthaí jabanna sceidealaithe agus teachtaireachtaí tras-ardáin ann.\n\nClóscríobh {sethome_cmd} chun an comhrá seo a dhéanamh mar do chainéal baile, nó déan neamhaird den fhógra seo."
   approval_expired: "⚠️ Tá an cead imithe in éag (níl an gníomhaire ag fanacht níos mó). Iarr ar an ngníomhaire iarracht eile a dhéanamh."
   draining:         "⏳ Ag fanacht le {count} gníomhaire(í) gníomhach roimh atosú..."
   goal_cleared:     "✓ Sprioc glanta."

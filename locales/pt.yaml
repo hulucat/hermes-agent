@@ -20,6 +20,10 @@ approval:
   blocklist_message: "Este comando está na lista de bloqueio incondicional e não pode ser aprovado."
 
 gateway:
+  pairing_code_notice: "Olá, ainda não reconheço você.\n\nSeu código de pareamento: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "Peça ao proprietário do bot para executar:\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "Há muitas solicitações de pareamento no momento. Tente novamente mais tarde."
+  home_channel_notice: "📬 Nenhum canal principal foi definido para esta plataforma. O Hermes entrega nele os resultados de tarefas agendadas e mensagens entre plataformas.\n\nDigite {sethome_cmd} para tornar esta conversa seu canal principal ou ignore este aviso."
   approval_expired: "⚠️ A aprovação expirou (o agente já não está à espera). Peça ao agente para tentar novamente."
   draining:         "⏳ A aguardar que {count} agente(s) ativo(s) terminem antes de reiniciar..."
   goal_cleared:     "✓ Objetivo removido."

@@ -20,6 +20,10 @@ approval:
   blocklist_message: "이 명령은 무조건 차단 목록에 있으며 승인할 수 없습니다."
 
 gateway:
+  pairing_code_notice: "안녕하세요, 아직 사용자를 확인할 수 없습니다.\n\n페어링 코드: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "봇 소유자에게 다음을 실행하도록 요청하세요:\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "현재 페어링 요청이 너무 많습니다. 잠시 후 다시 시도하세요."
+  home_channel_notice: "📬 이 플랫폼의 홈 채널이 설정되지 않았습니다. Hermes는 예약 작업 결과와 플랫폼 간 메시지를 홈 채널로 보냅니다.\n\n{sethome_cmd}을 입력해 이 채팅을 홈 채널로 지정하거나, 이 안내를 무시하세요."
   approval_expired: "⚠️ 승인이 만료되었습니다 (에이전트가 더 이상 대기하지 않습니다). 에이전트에게 다시 시도하도록 요청하세요."
   draining:         "⏳ 재시작 전에 활성 에이전트 {count}명을 정리하는 중..."
   goal_cleared:     "✓ 목표가 삭제되었습니다."

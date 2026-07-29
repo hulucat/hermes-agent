@@ -30,6 +30,10 @@ approval:
   blocklist_message: "This command is on the unconditional blocklist and cannot be approved."
 
 gateway:
+  pairing_code_notice: "Hi~ I don't recognize you yet!\n\nHere's your pairing code: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "Ask the bot owner to run:\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "Too many pairing requests right now. Please try again later."
+  home_channel_notice: "📬 No home channel is set for this platform. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType {sethome_cmd} to make this chat your home channel, or ignore to skip."
   # Messenger replies to slash commands and implicit state changes.
   approval_expired: "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
   draining:         "⏳ Draining {count} active agent(s) before restart..."

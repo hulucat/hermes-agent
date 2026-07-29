@@ -20,6 +20,10 @@ approval:
   blocklist_message: "Ez a parancs a feltétel nélküli tiltólistán van, és nem hagyható jóvá."
 
 gateway:
+  pairing_code_notice: "Üdvözlünk, még nem ismerünk fel.\n\nA párosítási kódod: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "Kérd meg a bot tulajdonosát, hogy futtassa ezt:\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "Jelenleg túl sok párosítási kérés érkezik. Kérjük, próbáld meg később."
+  home_channel_notice: "📬 Ehhez a platformhoz nincs otthoni csatorna beállítva. A Hermes ide kézbesíti az ütemezett feladatok eredményeit és a platformok közötti üzeneteket.\n\nÍrja be: {sethome_cmd}, hogy ezt a beszélgetést otthoni csatornává tegye, vagy hagyja figyelmen kívül ezt az értesítést."
   approval_expired: "⚠️ A jóváhagyás lejárt (az ügynök már nem vár). Kérd meg az ügynököt, hogy próbálja újra."
   draining:         "⏳ {count} aktív ügynök befejezésére várunk az újraindítás előtt..."
   goal_cleared:     "✓ A cél törölve."

@@ -20,6 +20,10 @@ approval:
   blocklist_message: "このコマンドは無条件ブロックリストに含まれており、承認できません。"
 
 gateway:
+  pairing_code_notice: "こんにちは。まだあなたを認識できません。\n\nペアリングコード：`{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "ボットの所有者に次を実行してもらってください：\n`hermes pairing approve {platform} {code}`"
+  pairing_rate_limited: "現在ペアリング要求が多すぎます。しばらくしてからもう一度お試しください。"
+  home_channel_notice: "📬 このプラットフォームにはホームチャンネルが設定されていません。ホームチャンネルは、Hermes が定期実行の結果とクロスプラットフォームのメッセージを届ける場所です。\n\n{sethome_cmd} と入力すると、このチャットをホームチャンネルに設定できます。不要な場合は無視してください。"
   approval_expired: "⚠️ 承認の有効期限が切れました（エージェントはもう待機していません）。エージェントに再試行を依頼してください。"
   draining:         "⏳ 再起動前に {count} 個のアクティブエージェントの終了を待っています..."
   goal_cleared:     "✓ 目標をクリアしました。"

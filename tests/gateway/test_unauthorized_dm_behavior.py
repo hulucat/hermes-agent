@@ -37,6 +37,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "DINGTALK_ALLOW_ALL_USERS", "FEISHU_ALLOW_ALL_USERS", "WECOM_ALLOW_ALL_USERS",
         "QQ_ALLOW_ALL_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
+        "HERMES_PAIRING_APPROVAL_INSTRUCTION",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -644,7 +645,35 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
         "tester",
     )
     adapter.send.assert_awaited_once()
-    assert "ABC12DEF" in adapter.send.await_args.args[1]
+    message = adapter.send.await_args.args[1]
+    assert "ABC12DEF" in message
+    assert "hermes pairing approve whatsapp ABC12DEF" in message
+
+
+@pytest.mark.asyncio
+async def test_pairing_notice_uses_hlmate_approval_instruction(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    monkeypatch.setenv(
+        "HERMES_PAIRING_APPROVAL_INSTRUCTION",
+        "请将此配对码提供给机器人管理员，由管理员在 HLMate 的“通道设置 → 配对审批”中完成批准。",
+    )
+    config = GatewayConfig(
+        platforms={Platform.DINGTALK: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.DINGTALK, config)
+    runner.pairing_store.generate_code.return_value = "JWK7BGMG"
+
+    result = await runner._handle_message(
+        _make_event(Platform.DINGTALK, "ding-user", "ding-chat"),
+    )
+
+    assert result is None
+    message = adapter.send.await_args.args[1]
+    assert "你好，我暂未获得使用授权" in message
+    assert "JWK7BGMG" in message
+    assert "HLMate 的“通道设置 → 配对审批”" in message
+    assert "hermes pairing approve" not in message
 
 
 @pytest.mark.asyncio
