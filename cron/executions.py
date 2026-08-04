@@ -20,9 +20,58 @@ from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+_TERMINAL_STATES = ("completed", "failed", "unknown", "skipped")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+
+def _create_execution_table(conn: sqlite3.Connection) -> None:
+    """Create the current execution ledger schema in an empty database."""
+    conn.execute(
+        """CREATE TABLE executions (
+             id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             source TEXT NOT NULL,
+             process_id TEXT NOT NULL,
+             pid INTEGER NOT NULL,
+             process_started_at INTEGER,
+             status TEXT NOT NULL CHECK(status IN
+               ('claimed','running','completed','failed','unknown','skipped')),
+             claimed_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT,
+             error TEXT,
+             output_file TEXT
+           )"""
+    )
+
+
+def _migrate_execution_table_if_needed(conn: sqlite3.Connection) -> None:
+    """Upgrade old ledgers so they can persist HLMate's ``skipped`` state."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    schema = str(row["sql"] or "") if row is not None else ""
+    if "'skipped'" in schema and "output_file" in schema:
+        return
+
+    # SQLite CHECK constraints cannot be altered. Rebuild atomically while
+    # retaining every audit row; no scheduled work is inferred from this ledger.
+    legacy_columns = {item["name"] for item in conn.execute("PRAGMA table_info(executions)")}
+    conn.execute("DROP INDEX IF EXISTS idx_executions_job_claimed")
+    conn.execute("DROP INDEX IF EXISTS idx_executions_status_claimed")
+    conn.execute("ALTER TABLE executions RENAME TO executions_legacy")
+    _create_execution_table(conn)
+    columns = [
+        "id", "job_id", "source", "process_id", "pid", "process_started_at",
+        "status", "claimed_at", "started_at", "finished_at", "error",
+    ]
+    target = ", ".join(columns + ["output_file"])
+    source = ", ".join(columns + (["output_file"] if "output_file" in legacy_columns else ["NULL"]))
+    conn.execute(
+        f"INSERT INTO executions ({target}) SELECT {source} FROM executions_legacy"
+    )
+    conn.execute("DROP TABLE executions_legacy")
 
 
 def _connect() -> sqlite3.Connection:
@@ -32,22 +81,13 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
-             id TEXT PRIMARY KEY,
-             job_id TEXT NOT NULL,
-             source TEXT NOT NULL,
-             process_id TEXT NOT NULL,
-             pid INTEGER NOT NULL,
-             process_started_at INTEGER,
-             status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
-             claimed_at TEXT NOT NULL,
-             started_at TEXT,
-             finished_at TEXT,
-             error TEXT
-           )"""
-    )
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    if table_exists:
+        _migrate_execution_table_if_needed(conn)
+    else:
+        _create_execution_table(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -89,7 +129,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','unknown','skipped')
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
@@ -151,6 +191,47 @@ def finish_execution(
         return _record(conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
+
+
+def set_execution_output(execution_id: str, output_file: str) -> Optional[Dict[str, Any]]:
+    """Attach the profile-relative output path produced by one execution.
+
+    Output is persisted before delivery, so this association remains useful
+    even when the destination channel later fails.  The path is deliberately
+    relative to ``cron/output``; callers must resolve it under that directory.
+    """
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET output_file=?
+               WHERE id=? AND status IN ('claimed','running','completed','failed')""",
+            (str(output_file), execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+
+
+def record_skipped_execution(job_id: str, *, reason: str, source: str = "hlmate") -> Dict[str, Any]:
+    """Append an immutable terminal record for work intentionally not run."""
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at, finished_at, error)
+               VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, ?, ?)""",
+            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+             _process_start_time(pid), now, now, str(reason)),
+        )
+        _prune_unlocked(conn)
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    return _record(row)  # type: ignore[return-value]
 
 
 def recover_interrupted_executions() -> int:

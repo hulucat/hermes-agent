@@ -12,7 +12,7 @@ Covers:
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -57,6 +57,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)
     app.router.add_post("/api/jobs", adapter._handle_create_job)
+    app.router.add_get("/api/cron/delivery-targets", adapter._handle_cron_delivery_targets)
+    app.router.add_get("/api/jobs/{job_id}/runs", adapter._handle_job_runs)
+    app.router.add_get("/api/jobs/{job_id}/runs/{run_id}/output", adapter._handle_job_run_output)
     app.router.add_get("/api/jobs/{job_id}", adapter._handle_get_job)
     app.router.add_patch("/api/jobs/{job_id}", adapter._handle_update_job)
     app.router.add_delete("/api/jobs/{job_id}", adapter._handle_delete_job)
@@ -168,6 +171,52 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+
+    @pytest.mark.asyncio
+    async def test_create_job_accepts_existing_web_conversation(self, adapter):
+        """Manual Cron creation can bind output to a persisted Web session."""
+        app = _create_app(adapter)
+        db = MagicMock()
+        db.get_session.return_value = {"id": "api-123", "source": "api_server"}
+        adapter._ensure_session_db_async = AsyncMock(return_value=db)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                response = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "web:api-123",
+                })
+
+        assert response.status == 200
+        assert mock_create.call_args.kwargs["deliver"] == "web:api-123"
+        db.get_session.assert_called_once_with("api-123")
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_missing_web_conversation(self, adapter):
+        app = _create_app(adapter)
+        db = MagicMock()
+        db.get_session.return_value = None
+        adapter._ensure_session_db_async = AsyncMock(return_value=db)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                response = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "web:api-missing",
+                })
+                body = await response.json()
+
+        assert response.status == 400
+        assert body["error"] == "Web conversation not found"
+        mock_create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
@@ -568,6 +617,88 @@ class TestAuthRequired:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# HLMate controlled history / output / delivery-target surfaces
+# ---------------------------------------------------------------------------
+
+class TestCronExecutionSurfaces:
+    @pytest.mark.asyncio
+    async def test_job_runs_are_scoped_to_existing_job(self, adapter):
+        app = _create_app(adapter)
+        records = [{"id": "f" * 32, "job_id": VALID_JOB_ID, "status": "completed"}]
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch("cron.executions.list_executions", return_value=records) as listed:
+                response = await cli.get(f"/api/jobs/{VALID_JOB_ID}/runs?limit=10")
+                payload = await response.json()
+        assert response.status == 200
+        assert payload["runs"] == records
+        listed.assert_called_once_with(job_id=VALID_JOB_ID, limit=10)
+
+    @pytest.mark.asyncio
+    async def test_run_output_rejects_path_escape(self, adapter, tmp_path):
+        app = _create_app(adapter)
+        run_id = "a" * 32
+        records = [{
+            "id": run_id,
+            "job_id": VALID_JOB_ID,
+            "status": "completed",
+            "output_file": "../../outside.md",
+        }]
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch("cron.executions.list_executions", return_value=records), patch(
+                "cron.jobs.get_cron_output_dir", return_value=tmp_path / "output"
+            ):
+                response = await cli.get(f"/api/jobs/{VALID_JOB_ID}/runs/{run_id}/output")
+        assert response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_delivery_targets_include_local_and_configured_channels(self, adapter):
+        app = _create_app(adapter)
+        platform_target = {"id": "feishu", "name": "Feishu", "home_target_set": True}
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                "cron.scheduler.cron_delivery_targets", return_value=[platform_target]
+            ):
+                response = await cli.get("/api/cron/delivery-targets")
+                payload = await response.json()
+        assert response.status == 200
+        assert payload["targets"] == [
+            {"id": "local", "name": "Local (save only)", "home_target_set": True, "home_env_var": None},
+            platform_target,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delivery_targets_include_persisted_web_conversations(self, adapter):
+        """The manual scheduler picker can target durable Web conversations."""
+        app = _create_app(adapter)
+        db = MagicMock()
+        db.list_sessions_rich.return_value = [{
+            "id": "api-123",
+            "source": "api_server",
+            "title": "每小时摘要",
+        }]
+        adapter._ensure_session_db_async = AsyncMock(return_value=db)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                "cron.scheduler.cron_delivery_targets", return_value=[]
+            ):
+                response = await cli.get("/api/cron/delivery-targets")
+                payload = await response.json()
+
+        assert response.status == 200
+        assert payload["targets"] == [
+            {"id": "local", "name": "Local (save only)", "home_target_set": True, "home_env_var": None},
+            {"id": "web:api-123", "name": "Web 对话：每小时摘要", "home_target_set": True, "home_env_var": None},
+        ]
+        db.list_sessions_rich.assert_called_once_with(
+            source="api_server", limit=50, order_by_last_active=True, compact_rows=True
+        )
 
 
 # ---------------------------------------------------------------------------

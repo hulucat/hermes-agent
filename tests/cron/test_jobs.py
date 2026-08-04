@@ -23,6 +23,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
+    skip_missed_jobs,
 )
 
 
@@ -256,6 +257,25 @@ class TestJobCRUD:
         create_job(prompt="Job 2", schedule="every 2h")
         jobs = list_jobs()
         assert len(jobs) == 2
+
+    def test_skip_missed_does_not_catch_up_recurring_or_oneshot(self, tmp_cron_dir):
+        """Deliberate HLMate stop advances recurrence and preserves missed one-shots."""
+        recurring = create_job(prompt="recurring", schedule="every 1h")
+        one_shot = create_job(prompt="one-shot", schedule="2h")
+        stale = (datetime.now().astimezone() - timedelta(minutes=5)).isoformat()
+        jobs = load_jobs()
+        for job in jobs:
+            job["next_run_at"] = stale
+        save_jobs(jobs)
+
+        result = skip_missed_jobs((datetime.now().astimezone() - timedelta(minutes=10)).isoformat())
+        current = {job["id"]: job for job in load_jobs()}
+
+        assert result == {"recurring": 1, "oneshot": 1, "total": 2}
+        assert current[recurring["id"]]["state"] == "scheduled"
+        assert datetime.fromisoformat(current[recurring["id"]]["next_run_at"]) > datetime.now().astimezone()
+        assert current[one_shot["id"]]["state"] == "missed"
+        assert current[one_shot["id"]]["enabled"] is False
 
     def test_list_jobs_normalizes_partial_legacy_records(self, tmp_cron_dir):
         save_jobs([

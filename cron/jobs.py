@@ -1489,6 +1489,84 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def skip_missed_jobs(after: str) -> Dict[str, int]:
+    """Advance work intentionally missed while a HLMate workbench was stopped.
+
+    The built-in scheduler normally runs one late recurring job on gateway
+    restart. HLMate's lifecycle contract is different: workbench stop means
+    *do not catch up*. This explicit operation is run before the gateway is
+    started again. Recurring jobs move to their next future slot; overdue
+    one-shots remain as visible ``missed`` configuration instead of being
+    deleted or dispatched.
+    """
+    try:
+        stopped_at = _ensure_aware(datetime.fromisoformat(str(after).replace("Z", "+00:00")))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("after must be an ISO 8601 timestamp") from exc
+
+    now = _hermes_now()
+    if stopped_at > now:
+        raise ValueError("after must not be in the future")
+    reason = (
+        "Skipped because the HLMate workbench was stopped from "
+        f"{stopped_at.isoformat()} until {now.isoformat()}."
+    )
+    recurring = 0
+    oneshot = 0
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        changed = False
+        for job in jobs:
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                continue
+            schedule = job.get("schedule") or {}
+            kind = schedule.get("kind") if isinstance(schedule, dict) else None
+            if kind not in {"cron", "interval", "once"}:
+                continue
+            next_run_at = job.get("next_run_at")
+            if not isinstance(next_run_at, str):
+                continue
+            try:
+                due_at = _ensure_aware(datetime.fromisoformat(next_run_at))
+            except ValueError:
+                continue
+            if due_at > now:
+                continue
+
+            # A stale due value proves the pending work was not dispatched.
+            # Include a prior-to-stop slot as well: it may have landed between
+            # the final scheduler tick and the deliberate gateway stop.
+            if kind in {"cron", "interval"}:
+                next_future = compute_next_run(schedule, now.isoformat())
+                if next_future is None:
+                    continue
+                job["next_run_at"] = next_future
+                job["last_skipped_at"] = now.isoformat()
+                job["last_skipped_reason"] = reason
+                job["state"] = "scheduled"
+                recurring += 1
+            else:
+                job["enabled"] = False
+                job["state"] = "missed"
+                job["next_run_at"] = None
+                job["missed_at"] = now.isoformat()
+                job["missed_reason"] = reason
+                oneshot += 1
+            changed = True
+            try:
+                from cron.executions import record_skipped_execution
+
+                record_skipped_execution(job["id"], reason=reason)
+            except Exception:
+                logger.exception("Failed to record skipped cron job %s", job.get("id"))
+                raise
+        if changed:
+            save_jobs(jobs)
+
+    return {"recurring": recurring, "oneshot": oneshot, "total": recurring + oneshot}
+
+
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)

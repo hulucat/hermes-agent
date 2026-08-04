@@ -162,6 +162,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
+    cron_skip_missed = cron_subparsers.add_parser(
+        "skip-missed",
+        help="Mark jobs missed during a deliberate scheduler stop without catch-up",
+    )
+    cron_skip_missed.add_argument(
+        "--after",
+        required=True,
+        help="ISO 8601 timestamp at which the scheduler was deliberately stopped",
+    )
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)

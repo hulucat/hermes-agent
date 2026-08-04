@@ -278,7 +278,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+    set_execution_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1138,11 +1143,40 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     origin = _resolve_origin(job)
 
+    # ``web:<session_id>`` is a durable API Server conversation target. It is
+    # explicit for picker-created jobs; chat-created jobs use the equivalent
+    # ``deliver=origin`` branch below and keep their original provenance.
+    from cron.web_delivery import parse_web_delivery_target
+
+    web_session_id = parse_web_delivery_target(deliver_value)
+    if web_session_id:
+        return {
+            "platform": "api_server",
+            "chat_id": web_session_id,
+            "thread_id": None,
+        }
+
     if deliver_value == "local":
         return None
 
     if deliver_value == "origin":
         if origin:
+            # API Server requests bind their real persisted session id as
+            # ``chat_id``. Unlike a request/SSE connection it remains valid
+            # after the browser closes, so Cron can append results to it.
+            if origin.get("platform") == "api_server":
+                session_id = str(origin.get("chat_id") or "")
+                if parse_web_delivery_target(f"web:{session_id}"):
+                    return {
+                        "platform": "api_server",
+                        "chat_id": session_id,
+                        "thread_id": None,
+                    }
+                logger.warning(
+                    "Job '%s': invalid API Server origin session id",
+                    job.get("id", "?"),
+                )
+                return None
             return {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
@@ -1502,6 +1536,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     else:
         delivery_content = content
 
+    # The API Server is not a transport adapter: its durable SQLite session is
+    # the delivery surface. Handle it before loading gateway platform config so
+    # a Web-only workbench can still receive Cron results with no IM channel.
+    from cron.web_delivery import deliver_web_result
+
+    delivery_errors = []
+    web_targets = [target for target in targets if target["platform"] == "api_server"]
+    for target in web_targets:
+        error = deliver_web_result(
+            session_id=str(target["chat_id"]),
+            job_name=str(job.get("name") or job.get("id") or "自动化任务"),
+            content=content,
+        )
+        if error:
+            msg = f"web delivery to {target['chat_id']} failed: {error}"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+        else:
+            logger.info(
+                "Job '%s': saved result to Web conversation %s",
+                job["id"], target["chat_id"],
+            )
+
+    targets = [target for target in targets if target["platform"] != "api_server"]
+    if not targets:
+        return "; ".join(delivery_errors) if delivery_errors else None
+
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
@@ -1526,8 +1587,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
-
-    delivery_errors = []
 
     for target in targets:
         platform_name = target["platform"]
@@ -3799,6 +3858,20 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         try:
             output_file = save_job_output(job["id"], output)
+            # The output filename is generated after a durable execution id
+            # exists. Persist their relation instead of making HLMate guess by
+            # timestamps, which collide under parallel runs.
+            if output_file is not None:
+                try:
+                    from cron.jobs import get_cron_output_dir
+
+                    relative_output = output_file.relative_to(get_cron_output_dir())
+                    set_execution_output(execution_id, relative_output.as_posix())
+                except Exception:
+                    logger.warning(
+                        "Job '%s': failed to link execution %s to its output",
+                        job["id"], execution_id, exc_info=True,
+                    )
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 

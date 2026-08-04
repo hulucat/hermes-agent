@@ -121,6 +121,20 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     assert failed["error"] == "provider exploded"
 
 
+def test_output_link_and_intentional_skip_are_durable(monkeypatch, tmp_path):
+    """HLMate can render an exact run output and an explicit no-catch-up event."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    running = executions.create_execution("job-output", source="builtin")
+    executions.mark_execution_running(running["id"])
+    executions.set_execution_output(running["id"], "job-output/2026-08-04_09-00-00.md")
+    completed = executions.finish_execution(running["id"], success=True)
+    skipped = executions.record_skipped_execution("job-output", reason="workbench stopped")
+
+    assert completed["output_file"] == "job-output/2026-08-04_09-00-00.md"
+    assert skipped["status"] == "skipped"
+    assert skipped["finished_at"] and skipped["error"] == "workbench stopped"
+
+
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("still-live", source="builtin")

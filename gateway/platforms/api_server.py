@@ -1505,6 +1505,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
+            ("GET", "/api/cron/delivery-targets", self._handle_cron_delivery_targets),
+            ("GET", "/api/jobs/{job_id}/runs", self._handle_job_runs),
+            ("GET", "/api/jobs/{job_id}/runs/{run_id}/output", self._handle_job_run_output),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
             ("PATCH", "/api/jobs/{job_id}", self._handle_update_job),
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
@@ -4134,6 +4137,37 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    async def _validate_web_delivery_targets(self, deliver: Any) -> Optional[str]:
+        """Ensure explicit ``web:<session_id>`` targets are live API sessions.
+
+        Cron keeps the target in jobs.json and may run hours later, so the
+        scheduler still handles a subsequently deleted conversation gracefully.
+        This validation only prevents creating a job that is already known to
+        point nowhere or to a non-API Server session in the same profile.
+        """
+        if not isinstance(deliver, str):
+            return None
+        from cron.web_delivery import parse_web_delivery_target
+
+        session_ids: list[str] = []
+        for part in (piece.strip() for piece in deliver.split(",")):
+            if not part.startswith("web:"):
+                continue
+            session_id = parse_web_delivery_target(part)
+            if not session_id:
+                return "Invalid Web conversation target"
+            session_ids.append(session_id)
+        if not session_ids:
+            return None
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return "Session database unavailable"
+        for session_id in session_ids:
+            session = await asyncio.to_thread(db.get_session, session_id)
+            if not session or session.get("source") != "api_server":
+                return "Web conversation not found"
+        return None
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -4184,6 +4218,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            web_delivery_error = await self._validate_web_delivery_targets(deliver)
+            if web_delivery_error:
+                return web.json_response({"error": web_delivery_error}, status=400)
 
             kwargs = {
                 "prompt": prompt,
@@ -4200,6 +4237,127 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_cron_delivery_targets(self, request: "web.Request") -> "web.Response":
+        """GET /api/cron/delivery-targets — safe destinations for cron output."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        targets = [{
+            "id": "local",
+            "name": "Local (save only)",
+            "home_target_set": True,
+            "home_env_var": None,
+        }]
+        try:
+            from cron.scheduler import cron_delivery_targets
+            from cron.web_delivery import web_delivery_target
+
+            db = await self._ensure_session_db_async()
+            if db is None:
+                return web.json_response({"error": "Session database unavailable"}, status=503)
+            sessions = await asyncio.to_thread(
+                db.list_sessions_rich,
+                source="api_server",
+                limit=50,
+                order_by_last_active=True,
+                compact_rows=True,
+            )
+            for session in sessions:
+                session_id = str(session.get("id") or "")
+                try:
+                    target_id = web_delivery_target(session_id)
+                except ValueError:
+                    # Old/manual API session IDs outside Cron's delimiter-safe
+                    # grammar cannot be selected, but remain usable otherwise.
+                    continue
+                label = str(session.get("title") or session.get("preview") or session_id)
+                targets.append({
+                    "id": target_id,
+                    "name": f"Web 对话：{label[:80]}",
+                    "home_target_set": True,
+                    "home_env_var": None,
+                })
+            targets.extend(cron_delivery_targets())
+        except Exception:
+            logger.exception("Failed to resolve cron delivery targets")
+            return web.json_response({"error": "Unable to resolve delivery targets"}, status=500)
+        return web.json_response({"targets": targets})
+
+    async def _handle_job_runs(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/runs — indexed durable execution history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            if not _cron_get(job_id):
+                return web.json_response({"error": "Job not found"}, status=404)
+            try:
+                limit = max(1, min(int(request.query.get("limit", "50")), 500))
+            except ValueError:
+                return web.json_response({"error": "limit must be an integer"}, status=400)
+            from cron.executions import list_executions
+
+            return web.json_response({"runs": list_executions(job_id=job_id, limit=limit)})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_job_run_output(self, request: "web.Request") -> "web.Response":
+        """GET one execution's persisted Markdown output without path escape."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        run_id = request.match_info["run_id"]
+        if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+            return web.json_response({"error": "Invalid run ID format"}, status=400)
+        try:
+            if not _cron_get(job_id):
+                return web.json_response({"error": "Job not found"}, status=404)
+            from cron.executions import list_executions
+            from cron.jobs import get_cron_output_dir
+
+            run = next(
+                (item for item in list_executions(job_id=job_id, limit=500) if item["id"] == run_id),
+                None,
+            )
+            if run is None:
+                return web.json_response({"error": "Run not found"}, status=404)
+            output_file = run.get("output_file")
+            if not output_file:
+                return web.json_response({"error": "Run has no saved output"}, status=404)
+            root = get_cron_output_dir().resolve()
+            candidate = (root / str(output_file)).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                logger.warning("Cron run %s carried unsafe output path", run_id)
+                return web.json_response({"error": "Run output is unavailable"}, status=404)
+            if not candidate.is_file():
+                return web.json_response({"error": "Run output no longer retained"}, status=404)
+            # Output is an audit artifact, not a streaming API. Cap reads so a
+            # corrupted or manually replaced file cannot exhaust gateway memory.
+            if candidate.stat().st_size > 2 * 1024 * 1024:
+                return web.json_response({"error": "Run output exceeds 2 MiB"}, status=413)
+            return web.Response(text=candidate.read_text(encoding="utf-8"), content_type="text/markdown")
+        except OSError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -4252,6 +4410,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            if "deliver" in sanitized:
+                web_delivery_error = await self._validate_web_delivery_targets(sanitized["deliver"])
+                if web_delivery_error:
+                    return web.json_response({"error": web_delivery_error}, status=400)
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
