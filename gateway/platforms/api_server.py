@@ -1517,6 +1517,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+            ("GET", "/v1/runs/{run_id}/model-usage", self._handle_run_model_usage),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
@@ -4888,6 +4889,97 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    # ------------------------------------------------------------------
+    # PATCH-004: model.used SSE + run_model_usage persistence
+    # ------------------------------------------------------------------
+
+    def _register_model_usage_hook(self, loop: "asyncio.AbstractEventLoop") -> None:
+        """Subscribe a post_api_request sink that emits ``model.used`` SSE
+        events and persists each resolved upstream model call.
+
+        Idempotent: a guard flag makes reconnect-safe re-registration a
+        no-op. The api_server is a host (not a plugin), so we append
+        directly to the plugin manager's hook list instead of going through
+        PluginContext.register_hook.
+        """
+        if getattr(self, "_model_usage_hook_registered", False):
+            return
+        self._model_usage_hook_registered = True
+        # Per-run SSE event sequence, advanced on the loop thread only.
+        self._run_model_seq: Dict[str, int] = {}
+
+        def _on_post_api_request(**kwargs: Any) -> None:
+            # Global filter: only /v1/runs agents carry run_id (set on the
+            # per-Run agent instance by _handle_runs). chat/completions, CLI
+            # and gateway agents leave it unset → skip silently.
+            run_id = kwargs.get("run_id")
+            if not run_id:
+                return
+            response_model = kwargs.get("response_model")
+            if not response_model:
+                return
+            # The hook fires on the agent's executor thread; the SSE Queue
+            # and the seq counter are owned by the event loop. Re-enter via
+            # call_soon_threadsafe so the counter stays single-threaded and
+            # the Queue is only touched from its owning loop (mirrors the
+            # _make_run_event_callback / _text_cb callbacks).
+            try:
+                loop.call_soon_threadsafe(
+                    self._on_model_used,
+                    run_id,
+                    response_model,
+                    kwargs.get("session_id") or "",
+                )
+            except Exception:
+                logger.debug("model.used scheduling failed", exc_info=True)
+
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            get_plugin_manager()._hooks.setdefault("post_api_request", []).append(
+                _on_post_api_request
+            )
+        except Exception:
+            logger.debug("post_api_request hook registration failed", exc_info=True)
+
+    def _on_model_used(
+        self, run_id: str, resolved_model: str, session_id: str
+    ) -> None:
+        """Emit one ``model.used`` SSE event and persist it. Loop-thread only."""
+        seq = self._run_model_seq.get(run_id, 0) + 1
+        self._run_model_seq[run_id] = seq
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait({
+                    "event": "model.used",
+                    "run_id": run_id,
+                    "seq": seq,
+                    "model": resolved_model,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+        # SessionDB is check_same_thread=False with its own write lock, but
+        # keep the write off the event loop — offload to a worker.
+        try:
+            asyncio.create_task(asyncio.to_thread(
+                self._persist_model_usage, run_id, session_id, seq, resolved_model,
+            ))
+        except Exception:
+            logger.debug("run_model_usage persist scheduling failed", exc_info=True)
+
+    def _persist_model_usage(
+        self, run_id: str, session_id: str, seq: int, resolved_model: str
+    ) -> None:
+        """Sync DB write, intended to run via asyncio.to_thread."""
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        try:
+            db.record_run_model_usage(run_id, session_id, seq, resolved_model)
+        except Exception:
+            logger.debug("run_model_usage write failed: %s", run_id, exc_info=True)
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -5010,6 +5102,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+        # PATCH-005: hlmate per-run workspace_root —— _run_sync 钉到
+        # effective_task_id(register_task_env_overrides), file_tools 写边界 +
+        # terminal cwd 都 per-run 隔离(E-03 多工作空间并行)。
+        workspace_root = body.get("workspace_root")
+        # C2.5: per-run mode 注入(wm_workspace_guard 按 Ask/Craft/Plan 判定工具权限)。
+        wm_mode = body.get("mode")
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -5086,6 +5184,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                     )
                 self._active_run_agents[run_id] = agent
+                # PATCH-004: tag the per-Run agent so the post_api_request
+                # hook (fired inside agent.run_conversation on the executor
+                # thread) can correlate each upstream model call to this run.
+                agent.run_id = run_id
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
@@ -5128,6 +5230,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    # PATCH-005: 钉 per-run workspace_root(同时 record_session_cwd,
+                    # terminal 默认 cwd 也钉到 workspace, 收窄写命令 cwd 盲区)。
+                    # C2.5: 同通道注入 wm_mode(wm_workspace_guard 读, 按 mode 判定工具权限)。
+                    task_env = {}
+                    if workspace_root:
+                        task_env["cwd"] = workspace_root
+                    if wm_mode:
+                        task_env["wm_mode"] = wm_mode
+                    if task_env:
+                        from tools.terminal_tool import register_task_env_overrides
+
+                        register_task_env_overrides(effective_task_id, task_env)
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -5138,12 +5252,39 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            # PATCH-005: 钉 prompt 层 cwd —— set_session_cwd 让
+                            # resolve_agent_cwd() 读 contextvar 返回 workspace,system
+                            # prompt 的 "Current working directory" = workspace,LLM 第一次
+                            # 就用 workspace(工具层隔离已由上面的 register_task_env_overrides
+                            # 钉 dict 兑现;此处置 contextvar 补 prompt 层)。与 set_current_
+                            # session_key 同模式(同 thread set → agent.run_conversation 内 build
+                            # system prompt 同 thread 读)。
+                            if workspace_root:
+                                from agent.runtime_cwd import set_session_cwd
+
+                                set_session_cwd(workspace_root)
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
                             )
                         finally:
+                            # PATCH-005: 清理 per-run env override(与 register 配对; C2.5 含 wm_mode)。
+                            if task_env:
+                                try:
+                                    from tools.terminal_tool import clear_task_env_overrides
+
+                                    clear_task_env_overrides(effective_task_id)
+                                except Exception:
+                                    pass
+                            # PATCH-005: 清 prompt 层 cwd contextvar(与 set_session_cwd 配对)。
+                            if workspace_root:
+                                try:
+                                    from agent.runtime_cwd import clear_session_cwd
+
+                                    clear_session_cwd()
+                                except Exception:
+                                    pass
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
@@ -5297,6 +5438,25 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return web.json_response(status)
 
+    async def _handle_run_model_usage(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/{run_id}/model-usage — resolved-model attribution
+        for AC-02. Authenticated by API_SERVER_KEY; WorkMate reads via the
+        backend's authenticated internal call, never state.db directly.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response([])
+        try:
+            rows = await asyncio.to_thread(db.get_run_model_usage, run_id)
+        except Exception:
+            rows = []
+        return web.json_response(rows)
+
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
         auth_err = self._check_auth(request)
@@ -5371,11 +5531,11 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_choice = str(body.get("choice", "")).strip().lower()
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
         choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
+        allowed = {"once", "session", "deny"}  # PATCH-006: hlmate 禁 always
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    "Invalid approval choice; expected one of: once, session, deny",  # PATCH-006
                     code="invalid_approval_choice",
                 ),
                 status=400,
@@ -5666,6 +5826,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
 
             self._mark_connected()
+            # PATCH-004: subscribe the model.used SSE + persistence sink to
+            # the post_api_request hook. Idempotent across reconnects.
+            self._register_model_usage_hook(asyncio.get_running_loop())
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,

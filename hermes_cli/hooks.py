@@ -180,6 +180,7 @@ _DEFAULT_PAYLOADS = {
         "finish_reason": "stop",
         "message_count": 4,
         "response_model": "claude-sonnet-4-6",
+        "run_id": None,
         "usage": {"input_tokens": 2048, "output_tokens": 512},
         "assistant_content_chars": 1200,
         "assistant_tool_call_count": 0,

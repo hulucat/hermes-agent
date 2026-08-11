@@ -423,14 +423,14 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={"choice": "session", "resolve_all": True},  # PATCH-006: hlmate 禁 always, 改用 session(测试核心是 per-run scoping, 非 always 持久化)
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
                 assert approval_data["resolved"] == 1
-                assert attacker_entry.result == "always"
+                assert attacker_entry.result == "session"  # PATCH-006: 配合 choice session
                 assert attacker_entry.event.is_set()
                 assert victim_entry.result is None
                 assert not victim_entry.event.is_set()

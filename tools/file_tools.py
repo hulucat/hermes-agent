@@ -439,6 +439,44 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         return None
 
 
+def _enforce_within_workspace(filepath: str, task_id: str = "default") -> str | None:
+    """PATCH-005: 强制写目标在 per-run workspace_root 内(绝对路径也校验)。
+
+    仅认 register_task_env_overrides 注入的 cwd(resolve_task_overrides),
+    **不 fallback** session cwd / $TERMINAL_CWD —— hermes 原生 gateway(不注入
+    override)行为完全不变(放行); 仅 hlmate 在 C2.4 透传 workspace_root 后启用
+    per-run 隔离。兑现 PATCH-005 文档承诺(原实现误用 _authoritative_workspace_root
+    会 fallback $TERMINAL_CWD, 误拦原生写)。
+    workspace_root 未注入 → 放行; 已知 → 相对/绝对路径都 resolve 后用
+    path_security.validate_within_dir 校验, 越界返回 tool_error 消息。
+    container 路径(PurePosixPath)放行(无法跨容器 realpath, MVP 桌面本地不走容器)。
+    """
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        overrides = resolve_task_overrides(task_id)
+    except Exception:
+        return None
+    ws_root = overrides.get("cwd") if isinstance(overrides, dict) else None
+    if not ws_root:
+        return None
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+        from pathlib import PurePosixPath
+
+        # PATCH-007: 精确类型匹配——POSIX 上 PosixPath 是 PurePosixPath 子类,
+        # isinstance 会把本地 PosixPath 误判为容器路径而放行, 绕过 validate_within_dir
+        # 边界检查(见 hermes-fork-patches.md PATCH-007)。只放行 container 分支返回的
+        # 纯 PurePosixPath。
+        if type(resolved) is PurePosixPath:
+            return None
+        from tools.path_security import validate_within_dir
+
+        return validate_within_dir(resolved, Path(str(ws_root)).resolve())
+    except Exception:
+        return None
+
+
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
     normalized = os.path.normpath(_expand_tilde(path))
@@ -1583,6 +1621,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    # PATCH-005: per-run workspace 写边界(绝对路径也校验, ws_root 未知则放行)。
+    ws_err = _enforce_within_workspace(path, task_id)
+    if ws_err:
+        return tool_error(ws_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -1711,6 +1753,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        # PATCH-005: per-run workspace 写边界(绝对路径也校验)。
+        ws_err = _enforce_within_workspace(_p, task_id)
+        if ws_err:
+            return tool_error(ws_err)
         if not cross_profile:
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:

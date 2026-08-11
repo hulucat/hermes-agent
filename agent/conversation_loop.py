@@ -4500,6 +4500,7 @@ def run_conversation(
                         finish_reason=finish_reason,
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),
+                        run_id=getattr(agent, "run_id", None),
                         response=agent._api_response_payload_for_hook(
                             response,
                             assistant_message,

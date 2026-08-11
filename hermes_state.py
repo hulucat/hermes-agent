@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -855,6 +855,20 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+-- PATCH-004: per-Run resolved-model attribution. One row per upstream API
+-- call inside a /v1/runs run; keyed by (run_id, seq) so concurrent runs
+-- sharing a session_id never collide. session_id FK CASCADEs so
+-- DELETE SESSION (backend saga) clears every belonging run automatically.
+CREATE TABLE IF NOT EXISTS run_model_usage (
+    run_id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    resolved_model TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'api',
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (run_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -904,6 +918,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_run_model_usage_run ON run_model_usage(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_model_usage_session ON run_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
@@ -1868,6 +1884,33 @@ class SessionDB:
                         )
                 except sqlite3.OperationalError as exc:
                     logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
+            if current_version < 23:
+                # v23 (PATCH-004): per-Run resolved-model attribution table.
+                # SCHEMA_SQL above also CREATEs it IF NOT EXISTS for fresh
+                # DBs; this step covers legacy DBs upgrading in place. Both
+                # paths are idempotent.
+                try:
+                    cursor.execute(
+                        """CREATE TABLE IF NOT EXISTS run_model_usage (
+                               run_id TEXT NOT NULL,
+                               session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                               seq INTEGER NOT NULL,
+                               resolved_model TEXT NOT NULL,
+                               reason TEXT NOT NULL DEFAULT 'api',
+                               timestamp TEXT NOT NULL,
+                               PRIMARY KEY (run_id, seq)
+                           )"""
+                    )
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_run_model_usage_run "
+                        "ON run_model_usage(run_id)"
+                    )
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_run_model_usage_session "
+                        "ON run_model_usage(session_id)"
+                    )
+                except sqlite3.OperationalError as exc:
+                    logger.debug("v23 run_model_usage create skipped: %s", exc)
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -6476,6 +6519,49 @@ class SessionDB:
                     pass
         except OSError:
             pass
+
+    # ------------------------------------------------------------------
+    # PATCH-004: per-Run resolved-model usage
+    # ------------------------------------------------------------------
+
+    def record_run_model_usage(
+        self,
+        run_id: str,
+        session_id: str,
+        seq: int,
+        resolved_model: str,
+        reason: str = "api",
+    ) -> None:
+        """Append one resolved-model attribution row for a /v1/runs call.
+
+        Thread-safe via ``_execute_write`` (BEGIN IMMEDIATE + lock + jitter
+        retry); safe to call from the agent executor thread or a worker
+        dispatched by asyncio.to_thread.
+        """
+        def _do(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO run_model_usage "
+                "(run_id, session_id, seq, resolved_model, reason, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, session_id, seq, resolved_model, reason, str(time.time())),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.OperationalError:
+            logger.debug("run_model_usage write failed for %s", run_id, exc_info=True)
+
+    def get_run_model_usage(self, run_id: str) -> List[Dict[str, Any]]:
+        """Return all resolved-model rows for *run_id* ordered by call seq."""
+        try:
+            rows = self._conn.execute(
+                "SELECT run_id, session_id, seq, resolved_model, reason, timestamp "
+                "FROM run_model_usage WHERE run_id = ? ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(r) for r in rows]
 
     def delete_session(
         self,
