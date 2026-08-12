@@ -298,6 +298,33 @@ class TestRunStatus:
 
 class TestRunEvents:
     @pytest.mark.asyncio
+    async def test_file_mutation_event_exposes_only_workspace_relative_paths(self, adapter, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.txt"
+        run_id = "run_file_paths"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        callback = adapter._make_run_event_callback(
+            run_id, asyncio.get_running_loop(), workspace_root=str(workspace),
+        )
+
+        callback(
+            "tool.completed",
+            "write_file",
+            duration=0.1,
+            is_error=False,
+            result='{"content":"must not be sent"}',
+            file_paths=[str(workspace / "nested/report.md"), str(outside)],
+        )
+        event = await queue.get()
+
+        assert event["file_paths"] == ["nested/report.md"]
+        assert str(workspace) not in repr(event)
+        assert "must not be sent" not in repr(event)
+
+    @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""
         app = _create_runs_app(adapter)

@@ -4980,8 +4980,41 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("run_model_usage write failed: %s", run_id, exc_info=True)
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        *,
+        workspace_root: str | None = None,
+    ):
+        """Return a tool_progress_callback that pushes structured events to the run's SSE queue.
+
+        File-mutation completion events carry only workspace-relative landed
+        paths. This lets WorkMate attribute a batch without exposing file
+        contents, absolute paths, or full tool arguments on the event stream.
+        """
+        try:
+            workspace_path = Path(workspace_root).resolve(strict=True) if workspace_root else None
+        except OSError:
+            workspace_path = None
+
+        def _workspace_relative_file_paths(raw_paths: object) -> list[str]:
+            if workspace_path is None or not isinstance(raw_paths, list):
+                return []
+            paths: list[str] = []
+            for raw_path in raw_paths:
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                candidate = Path(raw_path).expanduser()
+                path = candidate if candidate.is_absolute() else workspace_path / candidate
+                try:
+                    relative_path = path.resolve(strict=False).relative_to(workspace_path).as_posix()
+                except (OSError, ValueError):
+                    continue
+                if relative_path and relative_path != "." and relative_path not in paths:
+                    paths.append(relative_path)
+            return paths
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -5007,6 +5040,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                file_paths = _workspace_relative_file_paths(kwargs.get("file_paths"))
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -5014,6 +5048,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "file_paths": file_paths,
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -5122,7 +5157,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(
+            run_id, loop, workspace_root=workspace_root,
+        )
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""

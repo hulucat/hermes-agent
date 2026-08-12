@@ -37,6 +37,7 @@ from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
+    _extract_landed_file_mutation_paths,
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
@@ -888,7 +889,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            file_paths: list[str] = []
             if not blocked:
+                if not is_error:
+                    file_paths = _extract_landed_file_mutation_paths(
+                        function_name, function_args, function_result,
+                    )
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -918,6 +924,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=is_error,
                         result=function_result,
+                        file_paths=file_paths,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
@@ -1593,7 +1600,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
+        file_paths: list[str] = []
         if not _execution_blocked:
+            if not _is_error_result:
+                file_paths = _extract_landed_file_mutation_paths(
+                    function_name, function_args, function_result,
+                )
             function_result = agent._append_guardrail_observation(
                 function_name,
                 function_args,
@@ -1626,6 +1638,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     "tool.completed", function_name, None, None,
                     duration=tool_duration, is_error=_is_error_result,
                     result=function_result,
+                    file_paths=file_paths,
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
