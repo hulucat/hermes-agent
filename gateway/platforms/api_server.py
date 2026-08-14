@@ -137,6 +137,7 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+_WORKMATE_BRIDGE_SCRIPT_RE = re.compile(r"^workmate-automation-[0-9a-f]{32}\.py$")
 
 
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
@@ -4200,6 +4201,17 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            # PATCH-009: WorkMate core automation uses a profile-local,
+            # no-agent bridge script.  Keep script execution unavailable to
+            # ordinary API callers; the internal backend must opt in with the
+            # explicit marker and can only use its reserved script namespace.
+            workmate_bridge = body.get("workmate_bridge") is True
+            if ("script" in body or "no_agent" in body) and not workmate_bridge:
+                return web.json_response(
+                    {"error": "script and no_agent require WorkMate bridge"}, status=400,
+                )
+            script = body.get("script") if workmate_bridge else None
+            no_agent = body.get("no_agent") if workmate_bridge else False
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -4219,6 +4231,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            if workmate_bridge:
+                if not isinstance(script, str) or not _WORKMATE_BRIDGE_SCRIPT_RE.fullmatch(script):
+                    return web.json_response({"error": "Invalid WorkMate bridge script"}, status=400)
+                if no_agent is not True:
+                    return web.json_response({"error": "WorkMate bridge requires no_agent"}, status=400)
             web_delivery_error = await self._validate_web_delivery_targets(deliver)
             if web_delivery_error:
                 return web.json_response({"error": web_delivery_error}, status=400)
@@ -4234,6 +4251,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if workmate_bridge:
+                kwargs["script"] = script
+                kwargs["no_agent"] = True
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
@@ -4395,9 +4415,21 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             body = await request.json()
             # Whitelist allowed fields to prevent arbitrary key injection
-            sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
+            workmate_bridge = body.get("workmate_bridge") is True
+            if ("script" in body or "no_agent" in body) and not workmate_bridge:
+                return web.json_response(
+                    {"error": "script and no_agent require WorkMate bridge"}, status=400,
+                )
+            allowed_fields = self._UPDATE_ALLOWED_FIELDS | ({"script", "no_agent"} if workmate_bridge else set())
+            sanitized = {k: v for k, v in body.items() if k in allowed_fields}
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
+            if workmate_bridge:
+                script = sanitized.get("script")
+                if not isinstance(script, str) or not _WORKMATE_BRIDGE_SCRIPT_RE.fullmatch(script):
+                    return web.json_response({"error": "Invalid WorkMate bridge script"}, status=400)
+                if sanitized.get("no_agent") is not True:
+                    return web.json_response({"error": "WorkMate bridge requires no_agent"}, status=400)
             # Validate lengths if present
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
                 return web.json_response(

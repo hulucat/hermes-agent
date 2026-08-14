@@ -172,6 +172,27 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_script_receives_execution_context(self, cron_env):
+        """PATCH-009: Cron bridge gets a stable execution id and trigger time."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "execution_context.py"
+        script.write_text(
+            "import os\n"
+            "print(os.environ.get('HERMES_CRON_EXECUTION_ID', ''))\n"
+            "print(os.environ.get('HERMES_CRON_TRIGGER_AT', ''))\n",
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script(
+            "execution_context.py",
+            execution_id="execution-123",
+            trigger_at="2026-08-12T10:00:00+00:00",
+        )
+
+        assert success is True
+        assert output.splitlines() == ["execution-123", "2026-08-12T10:00:00+00:00"]
+
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script

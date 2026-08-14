@@ -173,6 +173,60 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
+    async def test_create_rejects_script_without_workmate_bridge(self, adapter):
+        """PATCH-009: ordinary API callers cannot create script cron jobs."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "ordinary", "schedule": "*/5 * * * *", "prompt": "x",
+                    "script": "arbitrary.py", "no_agent": True,
+                })
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_accepts_only_restricted_workmate_bridge(self, adapter):
+        """PATCH-009: bridge creation carries only reserved script + no_agent."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "bridge", "schedule": "every 5m", "prompt": "",
+                    "deliver": "local", "workmate_bridge": True,
+                    "script": "workmate-automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py", "no_agent": True,
+                })
+
+        assert resp.status == 200
+        assert mock_create.call_args.kwargs["script"] == "workmate-automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py"
+        assert mock_create.call_args.kwargs["no_agent"] is True
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_non_generated_workmate_bridge_name(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "bridge", "schedule": "every 5m", "prompt": "",
+                    "workmate_bridge": True,
+                    "script": "workmate-automation-not-a-generated-id.py",
+                    "no_agent": True,
+                })
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_create_job_accepts_existing_web_conversation(self, adapter):
         """Manual Cron creation can bind output to a persisted Web session."""
         app = _create_app(adapter)
@@ -432,6 +486,45 @@ class TestUpdateJob:
                 assert resp.status == 400
                 data = await resp.json()
                 assert "No valid fields" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_script_without_workmate_bridge(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"script": "arbitrary.py", "no_agent": True},
+                )
+
+        assert resp.status == 400
+        mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_accepts_complete_workmate_bridge(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={
+                        "workmate_bridge": True,
+                        "script": "workmate-automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py",
+                        "no_agent": True,
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_update.call_args.args == (
+            VALID_JOB_ID,
+            {"script": "workmate-automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py", "no_agent": True},
+        )
 
 
 # ---------------------------------------------------------------------------

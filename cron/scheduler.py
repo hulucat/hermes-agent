@@ -2076,6 +2076,13 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+# Per-run bridge metadata for the synchronous script call path.  The stored
+# cron job remains unchanged; each dispatch carries its own isolated tuple.
+_cron_script_execution_context: contextvars.ContextVar[
+    tuple[str | None, str | None]
+] = contextvars.ContextVar(
+    "cron_script_execution_context", default=(None, None)
+)
 
 
 def _get_script_timeout() -> int:
@@ -2169,7 +2176,12 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str,
+    *,
+    execution_id: str | None = None,
+    trigger_at: str | None = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2264,6 +2276,17 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "errors": "replace",
             }
         env = _sanitize_subprocess_env(os.environ.copy())
+        # PATCH-009: a trusted profile-local bridge script needs a stable
+        # trigger identity.  Keep this data process-local and read-only for
+        # the child; ordinary scripts simply ignore the two variables.
+        if execution_id is None or trigger_at is None:
+            contextual_execution_id, contextual_trigger_at = _cron_script_execution_context.get()
+            execution_id = execution_id or contextual_execution_id
+            trigger_at = trigger_at or contextual_trigger_at
+        if execution_id:
+            env["HERMES_CRON_EXECUTION_ID"] = execution_id
+        if trigger_at:
+            env["HERMES_CRON_TRIGGER_AT"] = trigger_at
         env.update(env_overlay)
         result = subprocess.run(
             argv,
@@ -2318,54 +2341,64 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
-    schedule = job.get("schedule")
-    claim = job.get("run_claim")
-    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    if not (
-        isinstance(schedule, dict)
-        and schedule.get("kind") == "once"
-        and owner
-    ):
-        return _run_job_script(script_path)
-
-    job_id = str(job.get("id") or "")
-    stop = threading.Event()
-    heartbeat_context = contextvars.copy_context()
-
-    def _heartbeat_loop() -> None:
-        while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
-            try:
-                heartbeat_run_claim(job_id, expected_owner=owner)
-            except Exception:
-                logger.debug(
-                    "Job '%s': script run_claim heartbeat failed",
-                    job_id,
-                    exc_info=True,
-                )
-
-    heartbeat_thread = threading.Thread(
-        target=heartbeat_context.run,
-        args=(_heartbeat_loop,),
-        name="cron-script-claim-heartbeat",
-        daemon=True,
-    )
+    # ContextVar preserves the historic one-argument script-runner seam used
+    # by claim-heartbeat callers and tests, while the concrete runner injects
+    # PATCH-009's child-process environment variables.
+    context_token = _cron_script_execution_context.set((
+        str(job.get("execution_id") or "") or None,
+        str(job.get("trigger_at") or "") or None,
+    ))
     try:
-        heartbeat_thread.start()
-    except Exception:
-        logger.debug(
-            "Job '%s': could not start script run_claim heartbeat",
-            job_id,
-            exc_info=True,
+        schedule = job.get("schedule")
+        claim = job.get("run_claim")
+        owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        if not (
+            isinstance(schedule, dict)
+            and schedule.get("kind") == "once"
+            and owner
+        ):
+            return _run_job_script(script_path)
+
+        job_id = str(job.get("id") or "")
+        stop = threading.Event()
+        heartbeat_context = contextvars.copy_context()
+
+        def _heartbeat_loop() -> None:
+            while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
+                try:
+                    heartbeat_run_claim(job_id, expected_owner=owner)
+                except Exception:
+                    logger.debug(
+                        "Job '%s': script run_claim heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_context.run,
+            args=(_heartbeat_loop,),
+            name="cron-script-claim-heartbeat",
+            daemon=True,
         )
-        return _run_job_script(script_path)
+        try:
+            heartbeat_thread.start()
+        except Exception:
+            logger.debug(
+                "Job '%s': could not start script run_claim heartbeat",
+                job_id,
+                exc_info=True,
+            )
+            return _run_job_script(script_path)
 
-    try:
-        return _run_job_script(script_path)
+        try:
+            return _run_job_script(script_path)
+        finally:
+            stop.set()
+            # Event.wait() wakes immediately.  Keep completion bounded if the
+            # heartbeat is already waiting on another process's jobs-file lock.
+            heartbeat_thread.join(timeout=1.0)
     finally:
-        stop.set()
-        # Event.wait() wakes immediately.  Keep completion bounded if the
-        # heartbeat is already waiting on another process's jobs-file lock.
-        heartbeat_thread.join(timeout=1.0)
+        _cron_script_execution_context.reset(context_token)
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -3822,6 +3855,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             set_secret_scope,
         )
 
+        # Make the durable execution id visible to no-agent scripts without
+        # mutating the persisted Job.  ``trigger_at`` is captured by the
+        # scheduler before it advances a recurring job to its next slot.
+        run_job_payload = dict(job, execution_id=execution_id)
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
@@ -3835,7 +3872,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                run_job_payload, defer_agent_teardown=_deferred_agents
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4094,7 +4131,11 @@ def tick(
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
+            dispatched_job = dict(
+                job,
+                execution_id=execution["id"],
+                trigger_at=job.get("next_run_at"),
+            )
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):

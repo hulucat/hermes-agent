@@ -210,6 +210,32 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+def test_run_job_no_agent_script_receives_execution_context(hermes_env):
+    """PATCH-009 passes one dispatch's execution metadata to its bridge script."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    script_path = hermes_env / "scripts" / "bridge_context.py"
+    script_path.write_text(
+        "import os\n"
+        "print(os.environ.get('HERMES_CRON_EXECUTION_ID', ''))\n"
+        "print(os.environ.get('HERMES_CRON_TRIGGER_AT', ''))\n",
+        encoding="utf-8",
+    )
+    job = create_job(
+        prompt=None, schedule="every 5m", script="bridge_context.py", no_agent=True,
+        deliver="local",
+    )
+    job["execution_id"] = "execution-123"
+    job["trigger_at"] = "2026-08-12T10:00:00+00:00"
+
+    success, _doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final_response.splitlines() == ["execution-123", "2026-08-12T10:00:00+00:00"]
+
+
 def test_run_job_no_agent_empty_output_is_silent(hermes_env):
     """Empty stdout → SILENT_MARKER, which suppresses delivery downstream."""
     from cron.jobs import create_job
