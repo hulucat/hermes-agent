@@ -89,6 +89,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.memory_manager import sanitize_context
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
@@ -125,6 +126,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_RUN_REASONING_SEGMENT_CHARS = 32_000
+MAX_RUN_REASONING_CHARS = 128_000
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1757,6 +1760,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1874,6 +1878,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -2201,7 +2206,18 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        payload = {key: message.get(key) for key in safe_keys if key in message}
+        # Session history is an egress boundary. Keep its original payload for
+        # replay, but never return raw provider reasoning to an HTTP client.
+        for key in ("reasoning", "reasoning_content"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                payload[key] = redact_sensitive_text(
+                    sanitize_context(value),
+                    force=True,
+                    redact_url_credentials=True,
+                )
+        return payload
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -5018,6 +5034,7 @@ class APIServerAdapter(BasePlatformAdapter):
         loop: "asyncio.AbstractEventLoop",
         *,
         workspace_root: str | None = None,
+        before_event=None,
     ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue.
 
@@ -5064,6 +5081,8 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
+                if before_event is not None:
+                    before_event()
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -5072,6 +5091,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                if before_event is not None:
+                    before_event()
                 file_paths = _workspace_relative_file_paths(kwargs.get("file_paths"))
                 _push({
                     "event": "tool.completed",
@@ -5111,6 +5132,12 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        if "include_reasoning" in body and not isinstance(body["include_reasoning"], bool):
+            return web.json_response(
+                _openai_error("'include_reasoning' must be a boolean"), status=400
+            )
+        include_reasoning = body.get("include_reasoning", False)
 
         raw_input = body.get("input")
         if not raw_input:
@@ -5189,14 +5216,99 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(
-            run_id, loop, workspace_root=workspace_root,
-        )
-
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
+
+        # Reasoning deltas can arrive on the agent executor thread. Buffer a
+        # whole model segment there, then cross the SSE egress boundary only
+        # after sanitising and force-redacting the assembled text.
+        reasoning_state = {
+            "parts": [],
+            "segment_seq": 0,
+            "segment_chars": 0,
+            "run_chars": 0,
+            "started": False,
+            "truncated": False,
+        }
+
+        def _append_reasoning_on_loop(delta: object) -> None:
+            if not include_reasoning or self._run_streams.get(run_id) is not q:
+                return
+            text = str(delta or "")
+            if not text:
+                return
+            available = min(
+                MAX_RUN_REASONING_SEGMENT_CHARS - reasoning_state["segment_chars"],
+                MAX_RUN_REASONING_CHARS - reasoning_state["run_chars"],
+            )
+            if available <= 0:
+                # A later delta proves this active segment overflowed even
+                # when an earlier delta ended exactly at the configured cap.
+                if reasoning_state["started"]:
+                    reasoning_state["truncated"] = True
+                return
+            accepted = text[:available]
+            if not reasoning_state["started"]:
+                reasoning_state["started"] = True
+                reasoning_state["segment_seq"] += 1
+                _put_event_if_active({
+                    "event": "reasoning.started",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "segment_seq": reasoning_state["segment_seq"],
+                })
+            reasoning_state["parts"].append(accepted)
+            reasoning_state["segment_chars"] += len(accepted)
+            reasoning_state["run_chars"] += len(accepted)
+            if len(accepted) < len(text):
+                reasoning_state["truncated"] = True
+
+        def _flush_reasoning_on_loop() -> None:
+            if not include_reasoning or not reasoning_state["started"]:
+                return
+            raw_text = "".join(reasoning_state["parts"])
+            text = redact_sensitive_text(
+                sanitize_context(raw_text),
+                force=True,
+                redact_url_credentials=True,
+            )
+            _put_event_if_active({
+                "event": "reasoning.completed",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "segment_seq": reasoning_state["segment_seq"],
+                "text": text,
+                "truncated": reasoning_state["truncated"],
+            })
+            reasoning_state["parts"] = []
+            reasoning_state["segment_chars"] = 0
+            reasoning_state["started"] = False
+            reasoning_state["truncated"] = False
+
+        def _reasoning_cb(delta: Optional[str]) -> None:
+            if delta is None or not include_reasoning or run_id not in self._run_streams:
+                return
+            try:
+                loop.call_soon_threadsafe(_append_reasoning_on_loop, delta)
+            except Exception:
+                pass
+
+        def _schedule_reasoning_flush() -> None:
+            if not include_reasoning:
+                return
+            try:
+                loop.call_soon_threadsafe(_flush_reasoning_on_loop)
+            except Exception:
+                pass
+
+        event_cb = self._make_run_event_callback(
+            run_id,
+            loop,
+            workspace_root=workspace_root,
+            before_event=_schedule_reasoning_flush if include_reasoning else None,
+        )
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -5205,6 +5317,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if run_id not in self._run_streams:
                 return
             try:
+                _schedule_reasoning_flush()
                 loop.call_soon_threadsafe(_put_event_if_active, {
                     "event": "message.delta",
                     "run_id": run_id,
@@ -5251,6 +5364,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        **({"reasoning_callback": _reasoning_cb} if include_reasoning else {}),
                     )
                 self._active_run_agents[run_id] = agent
                 # PATCH-004: tag the per-Run agent so the post_api_request
@@ -5375,6 +5489,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                # Let executor-thread callbacks enter the loop before the
+                # terminal boundary flushes their final reasoning segment.
+                await asyncio.sleep(0)
+                _flush_reasoning_on_loop()
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -5420,6 +5538,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                _flush_reasoning_on_loop()
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -5435,6 +5554,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 raise
             except Exception as exc:
+                _flush_reasoning_on_loop()
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
                     run_id,

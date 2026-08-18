@@ -20,6 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    MAX_RUN_REASONING_SEGMENT_CHARS,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -173,6 +174,17 @@ class TestStartRun:
         assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_start_rejects_non_boolean_include_reasoning(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs", json={"input": "hello", "include_reasoning": "true"}
+            )
+            data = await resp.json()
+        assert resp.status == 400
+        assert "include_reasoning" in data["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_start_invalid_history_does_not_allocate_run(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -297,6 +309,101 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_reasoning_is_opt_in_buffered_redacted_and_flushed_before_boundaries(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create_agent(**kwargs):
+            captured.update(kwargs)
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["reasoning_callback"]("Inspect OPENAI_API_KEY=sk-live-secret-1234567890")
+                kwargs["tool_progress_callback"]("tool.started", "web_search")
+                kwargs["reasoning_callback"]("Synthesize the result")
+                kwargs["stream_delta_callback"]("Answer")
+                return {"final_response": "Answer"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hello", "include_reasoning": True}
+                )
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_response.text()
+
+        assert captured["reasoning_callback"] is not None
+        assert "sk-live-secret-1234567890" not in body
+        first_started = body.index('"event": "reasoning.started"')
+        first_completed = body.index('"event": "reasoning.completed"')
+        tool_started = body.index('"event": "tool.started"')
+        second_started = body.index('"event": "reasoning.started"', first_started + 1)
+        second_completed = body.index('"event": "reasoning.completed"', first_completed + 1)
+        message_delta = body.index('"event": "message.delta"')
+        completed = body.index('"event": "run.completed"')
+        assert first_started < first_completed < tool_started < second_started < second_completed < message_delta < completed
+
+    @pytest.mark.asyncio
+    async def test_reasoning_segment_is_marked_truncated_at_cap(self, adapter):
+        app = _create_runs_app(adapter)
+
+        def _create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["reasoning_callback"]("x" * MAX_RUN_REASONING_SEGMENT_CHARS)
+                kwargs["reasoning_callback"]("y")
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hello", "include_reasoning": True}
+                )
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_response.text()
+
+        assert '"event": "reasoning.completed"' in body
+        assert '"truncated": true' in body
+
+    @pytest.mark.asyncio
+    async def test_reasoning_callback_is_not_registered_by_default(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create_agent(**kwargs):
+            captured.update(kwargs)
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "done"}
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                await events_response.text()
+
+        assert "reasoning_callback" not in captured
+
     @pytest.mark.asyncio
     async def test_file_mutation_event_exposes_only_workspace_relative_paths(self, adapter, tmp_path):
         workspace = tmp_path / "workspace"

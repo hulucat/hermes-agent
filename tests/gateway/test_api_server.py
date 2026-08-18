@@ -79,6 +79,22 @@ class TestRedactApiErrorText:
         assert _redact_api_error_text("Job not found") == "Job not found"
 
 
+class TestMessageResponseReasoningRedaction:
+    def test_reasoning_is_sanitized_and_force_redacted_at_history_egress(self):
+        secret = "sk-history-secret-1234567890"
+        response = APIServerAdapter._message_response({
+            "id": "msg_1",
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": f"<memory-context>hidden</memory-context> OPENAI_API_KEY={secret}",
+            "reasoning_content": f"https://user:{secret}@example.test/path",
+        })
+
+        assert secret not in repr(response)
+        assert "hidden" not in response["reasoning"]
+        assert response["content"] == "answer"
+
+
 # ---------------------------------------------------------------------------
 # ResponseStore
 # ---------------------------------------------------------------------------
