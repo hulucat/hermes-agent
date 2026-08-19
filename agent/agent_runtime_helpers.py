@@ -1637,10 +1637,28 @@ def dump_api_request_debug(
                 "type": type(error).__name__,
                 "message": str(error),
             }
+            try:
+                from agent.process_bootstrap import request_id_from_error
+
+                request_id = request_id_from_error(error)
+            except Exception:
+                request_id = None
+            if request_id is not None:
+                header, value = request_id
+                # The ID is generated locally in the request hook and is safe
+                # to retain; Authorization remains masked separately below.
+                dump_payload["request"]["headers"][header] = value
+                error_info["request_id"] = value
             for attr_name in ("status_code", "request_id", "code", "param", "type"):
                 attr_value = getattr(error, attr_name, None)
                 if attr_value is not None:
-                    error_info[attr_name] = attr_value
+                    if attr_name == "request_id" and "request_id" in error_info:
+                        # Preserve the locally generated correlation ID as
+                        # the primary value; a provider-returned ID remains
+                        # useful diagnostics but must not replace it.
+                        error_info["provider_request_id"] = attr_value
+                    else:
+                        error_info[attr_name] = attr_value
 
             body_attr = getattr(error, "body", None)
             if body_attr is not None:

@@ -24,11 +24,16 @@ unchanged.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import urllib.request
+import uuid
 from typing import Any, Optional
 
 from utils import base_url_hostname, normalize_proxy_url
+
+
+_HTTP_FIELD_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 # Cached at module level so we only pay the OpenAI SDK import cost once
@@ -147,6 +152,7 @@ def build_keepalive_http_client(
     *,
     async_mode: bool = False,
     verify: Any = True,
+    request_id_header: str | None = None,
 ) -> Optional[Any]:
     """Build an httpx client for OpenAI SDK calls with env-only proxy policy.
 
@@ -168,6 +174,11 @@ def build_keepalive_http_client(
     ``ssl_ca_cert`` / ``ssl_verify`` and ``HERMES_CA_BUNDLE`` settings the main
     client uses. It is passed on the client AND on the plain no-proxy mounts
     (a mounted transport owns the SSL context for its scheme).
+
+    ``request_id_header`` opts a client into a fresh UUID4 request ID for
+    every outbound HTTP attempt. The header name is configuration; its value
+    is deliberately created in an httpx request hook, never in static client
+    headers, so retries cannot reuse a billing or tracing ID.
     """
     try:
         import httpx
@@ -190,15 +201,63 @@ def build_keepalive_http_client(
                 "http://": transport_cls(verify=verify),
                 "https://": transport_cls(verify=verify),
             }
+        event_hooks = _request_id_event_hooks(request_id_header)
         return client_cls(
             limits=limits,
             timeout=timeout,
             proxy=proxy,
             mounts=mounts or None,
             verify=verify,
+            **({"event_hooks": event_hooks} if event_hooks else {}),
         )
     except Exception:
         return None
+
+
+def normalize_request_id_header(value: Any) -> str | None:
+    """Return a valid HTTP field name or ``None`` for an unset/invalid value."""
+    if not isinstance(value, str):
+        return None
+    header = value.strip()
+    return header if _HTTP_FIELD_NAME_RE.fullmatch(header) else None
+
+
+def _request_id_event_hooks(request_id_header: str | None) -> dict[str, list] | None:
+    header = normalize_request_id_header(request_id_header)
+    if header is None:
+        return None
+
+    def inject_request_id(request: Any) -> None:
+        request_id = str(uuid.uuid4())
+        request.headers[header] = request_id
+        # Preserve only the ID we generated. Error handlers receive the
+        # originating ``httpx.Request`` through ``response.request`` and can
+        # therefore persist/display the exact failed attempt without trusting
+        # response-controlled headers.
+        request.extensions["hermes.request_id_header"] = header
+        request.extensions["hermes.request_id"] = request_id
+
+    return {"request": [inject_request_id]}
+
+
+def request_id_from_error(error: BaseException) -> tuple[str, str] | None:
+    """Return the request ID injected by this process for an HTTP error.
+
+    Only values stored by ``_request_id_event_hooks`` are accepted. This keeps
+    the error surface independent from arbitrary provider response headers.
+    """
+    response = getattr(error, "response", None)
+    request = getattr(response, "request", None)
+    extensions = getattr(request, "extensions", None)
+    if not isinstance(extensions, dict):
+        return None
+    header = extensions.get("hermes.request_id_header")
+    request_id = extensions.get("hermes.request_id")
+    if not isinstance(header, str) or not isinstance(request_id, str):
+        return None
+    if normalize_request_id_header(header) is None or not request_id:
+        return None
+    return header, request_id
 
 
 def _install_safe_stdio() -> None:
@@ -224,4 +283,6 @@ __all__ = [
     "_get_proxy_from_env",
     "_get_proxy_for_base_url",
     "build_keepalive_http_client",
+    "normalize_request_id_header",
+    "request_id_from_error",
 ]
