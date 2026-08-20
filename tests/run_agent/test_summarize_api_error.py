@@ -58,6 +58,27 @@ def test_empty_body_fallback_redacts_secrets(monkeypatch):
     assert "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in summary
 
 
+def test_summary_appends_locally_injected_request_id():
+    request = httpx.Request(
+        "POST",
+        "https://partner.test/v1/chat/completions",
+        headers={"X-WM-Request-Id": "f095e9b2-fcd3-41f4-bb9b-9d17f2bfa857"},
+        extensions={
+            "hermes.request_id_header": "X-WM-Request-Id",
+            "hermes.request_id": "f095e9b2-fcd3-41f4-bb9b-9d17f2bfa857",
+        },
+    )
+    err = Exception("request blocked")
+    err.status_code = 403
+    err.body = {"error": {"message": "请求内容不符合安全规范，已拦截"}}
+    err.response = httpx.Response(403, request=request)
+
+    summary = AIAgent._summarize_api_error(err)
+
+    assert "HTTP 403: 请求内容不符合安全规范，已拦截" in summary
+    assert summary.endswith("Request ID: f095e9b2-fcd3-41f4-bb9b-9d17f2bfa857")
+
+
 def test_unread_streaming_response_does_not_crash_and_falls_back_to_exception_message():
     """Unread streaming responses must not replace the real provider error."""
 
@@ -78,4 +99,3 @@ def test_unread_streaming_response_does_not_crash_and_falls_back_to_exception_me
     summary = AIAgent._summarize_api_error(err)
     assert "HTTP 429" in summary
     assert "Gemini HTTP 429: quota exceeded" in summary
-

@@ -112,6 +112,8 @@ from agent.process_bootstrap import (
     OpenAI,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.OpenAI")
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
+    build_keepalive_http_client,
+    normalize_request_id_header,
 )
 from agent.iteration_budget import IterationBudget
 
@@ -2274,7 +2276,9 @@ class AIAgent:
             isinstance(error, ValueError)
             and "expected ident at line" in raw.lower()
         ):
-            return f"Malformed provider streaming response: {raw[:300]}"
+            return AIAgent._append_request_id(
+                error, f"Malformed provider streaming response: {raw[:300]}"
+            )
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
         if "<!DOCTYPE" in raw or "<html" in raw:
@@ -2290,7 +2294,7 @@ class AIAgent:
             parts.append(title)
             if ray_id:
                 parts.append(f"Ray {ray_id}")
-            return " — ".join(parts)
+            return AIAgent._append_request_id(error, " — ".join(parts))
 
         # JSON body errors from OpenAI/Anthropic SDKs
         body = getattr(error, "body", None)
@@ -2300,7 +2304,10 @@ class AIAgent:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
                 msg = AIAgent._coerce_api_error_detail(msg)
-                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+                return AIAgent._append_request_id(
+                    error,
+                    AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}"),
+                )
 
         # SDK may leave body empty while httpx still has the payload (#36109).
         # Redact before returning: the raw provider/proxy error body is
@@ -2323,15 +2330,39 @@ class AIAgent:
                 if isinstance(payload, dict):
                     err = payload.get("error")
                     if isinstance(err, dict) and err.get("message"):
-                        return redact_sensitive_text(f"{prefix}{str(err['message'])[:300]}")
+                        return AIAgent._append_request_id(
+                            error,
+                            redact_sensitive_text(f"{prefix}{str(err['message'])[:300]}"),
+                        )
                     if payload.get("message"):
-                        return redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}")
-                return redact_sensitive_text(f"{prefix}{snippet[:300]}")
+                        return AIAgent._append_request_id(
+                            error,
+                            redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}"),
+                        )
+                return AIAgent._append_request_id(
+                    error, redact_sensitive_text(f"{prefix}{snippet[:300]}")
+                )
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
-        return AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
+        return AIAgent._append_request_id(
+            error, AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
+        )
+
+    @staticmethod
+    def _append_request_id(error: Exception, summary: str) -> str:
+        """Append this process's opaque failed-attempt ID when available."""
+        try:
+            from agent.process_bootstrap import request_id_from_error
+
+            request_id = request_id_from_error(error)
+        except Exception:
+            request_id = None
+        if request_id is None:
+            return summary
+        _, value = request_id
+        return f"{summary}\nRequest ID: {value}"
 
     def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
         # Azure Foundry Entra ID bearer providers are callables — never
@@ -4090,48 +4121,18 @@ class AIAgent:
         for its scheme).
         """
         try:
-            import httpx as _httpx
+            from hermes_cli.config import cfg_get, load_config
 
-            # Explicitly read proxy settings so requests route through
-            # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
-            _proxy = _get_proxy_for_base_url(base_url)
-
-            # Proactive pool reaping: close idle connections at 20 s,
-            # before reverse proxies (30–60 s typical) send FIN and
-            # cause CLOSE-WAIT accumulation.
-            _limits = _httpx.Limits(
-                max_keepalive_connections=20,
-                max_connections=100,
-                keepalive_expiry=20.0,
-            )
-
-            # Timeouts: generous read=None for SSE streaming endpoints.
-            _timeout = _httpx.Timeout(
-                connect=15.0,
-                read=None,
-                write=15.0,
-                pool=10.0,
-            )
-
-            # When _proxy is None (NO_PROXY bypass or no proxy configured),
-            # mount plain transports to prevent httpx from reading env proxy
-            # vars and creating an HTTPProxy mount that would bypass our
-            # NO_PROXY resolution.
-            _mounts = {}
-            if _proxy is None:
-                _mounts = {
-                    "http://": _httpx.HTTPTransport(verify=verify),
-                    "https://": _httpx.HTTPTransport(verify=verify),
-                }
-            return _httpx.Client(
-                limits=_limits,
-                timeout=_timeout,
-                proxy=_proxy,
-                mounts=_mounts or None,
-                verify=verify,
+            request_id_header = normalize_request_id_header(
+                cfg_get(load_config(), "model", "request_id_header")
             )
         except Exception:
-            return None
+            request_id_header = None
+        return build_keepalive_http_client(
+            base_url,
+            verify=verify,
+            request_id_header=request_id_header,
+        )
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
