@@ -5287,6 +5287,22 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_state["started"] = False
             reasoning_state["truncated"] = False
 
+        message_state = {"seq": 0}
+
+        def _append_text_on_loop(delta: str) -> None:
+            """Assign per-run content order on the event loop before enqueueing."""
+            if self._run_streams.get(run_id) is not q:
+                return
+            _flush_reasoning_on_loop()
+            message_state["seq"] += 1
+            _put_event_if_active({
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "seq": message_state["seq"],
+                "delta": delta,
+            })
+
         def _reasoning_cb(delta: Optional[str]) -> None:
             if delta is None or not include_reasoning or run_id not in self._run_streams:
                 return
@@ -5317,13 +5333,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if run_id not in self._run_streams:
                 return
             try:
-                _schedule_reasoning_flush()
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
+                loop.call_soon_threadsafe(_append_text_on_loop, delta)
             except Exception:
                 pass
 

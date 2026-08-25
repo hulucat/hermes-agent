@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -309,6 +310,52 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_message_delta_seq_is_monotonic_and_isolated_per_run(self, adapter):
+        app = _create_runs_app(adapter)
+
+        def _create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["stream_delta_callback"]("first")
+                kwargs["stream_delta_callback"]("second")
+                return {"final_response": "firstsecond"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                first_response = await cli.post("/v1/runs", json={"input": "first"})
+                second_response = await cli.post("/v1/runs", json={"input": "second"})
+                first_run = (await first_response.json())["run_id"]
+                second_run = (await second_response.json())["run_id"]
+                first_body = await (
+                    await cli.get(f"/v1/runs/{first_run}/events")
+                ).text()
+                second_body = await (
+                    await cli.get(f"/v1/runs/{second_run}/events")
+                ).text()
+
+        def message_deltas(body):
+            events = [
+                json.loads(line.removeprefix("data: "))
+                for line in body.splitlines()
+                if line.startswith("data: ")
+            ]
+            return [event for event in events if event["event"] == "message.delta"]
+
+        first_deltas = message_deltas(first_body)
+        second_deltas = message_deltas(second_body)
+        assert [event["seq"] for event in first_deltas] == [1, 2]
+        assert [event["seq"] for event in second_deltas] == [1, 2]
+        assert {event["run_id"] for event in first_deltas} == {first_run}
+        assert {event["run_id"] for event in second_deltas} == {second_run}
+
     @pytest.mark.asyncio
     async def test_reasoning_is_opt_in_buffered_redacted_and_flushed_before_boundaries(self, adapter):
         app = _create_runs_app(adapter)
