@@ -131,6 +131,32 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_bridge_execution_context_is_injected(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "workmate-automation-context.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                print(os.environ["HERMES_CRON_EXECUTION_ID"])
+                print(os.environ["HERMES_CRON_TRIGGER_AT"])
+                """
+            )
+        )
+
+        success, output = _run_job_script(
+            script.name,
+            execution_id="execution-123",
+            trigger_at="2026-08-26T08:00:00+00:00",
+        )
+
+        assert success is True
+        assert output.splitlines() == [
+            "execution-123",
+            "2026-08-26T08:00:00+00:00",
+        ]
+
     @pytest.mark.windows_only
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         # Windows-only: the fake ``sys.platform`` could not reproduce the

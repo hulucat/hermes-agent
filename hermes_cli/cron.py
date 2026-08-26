@@ -244,6 +244,25 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             print(f"    {record['error']}")
 
 
+def cron_skip_missed(after: str) -> int:
+    """Apply WorkMate's deliberate-stop no-catch-up policy."""
+    from cron.jobs import skip_missed_jobs
+
+    try:
+        result = skip_missed_jobs(after)
+    except ValueError as exc:
+        print(color(f"Failed to skip missed jobs: {exc}", Colors.RED))
+        return 1
+    print(
+        color(
+            "Skipped missed work: "
+            f"{result['recurring']} recurring, {result['oneshot']} one-shot.",
+            Colors.GREEN,
+        )
+    )
+    return 0
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -643,6 +662,9 @@ def cron_command(args):
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
 
+    if subcmd == "skip-missed":
+        return cron_skip_missed(args.after)
+
     if subcmd == "notepad":
         return cron_notepad(args)
 
@@ -665,5 +687,8 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print(
+        "Usage: hermes cron "
+        "[list|create|edit|pause|resume|run|remove|status|runs|skip-missed|tick]"
+    )
     sys.exit(1)

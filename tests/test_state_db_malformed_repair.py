@@ -443,6 +443,7 @@ def _lock_held_by_other_process(db_path: Path, hold_seconds: float = 30.0):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.live_system_guard_bypass
 def test_repair_skips_surgery_while_another_process_holds_the_lock(
     tmp_path, monkeypatch
 ):
@@ -464,6 +465,7 @@ def test_repair_skips_surgery_while_another_process_holds_the_lock(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.live_system_guard_bypass
 def test_repair_reports_success_when_the_holder_already_healed_the_db(
     tmp_path, monkeypatch
 ):

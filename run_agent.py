@@ -113,6 +113,8 @@ from agent.process_bootstrap import (
     OpenAI,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.OpenAI")
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
+    build_keepalive_http_client,
+    normalize_request_id_header,
 )
 from agent.iteration_budget import IterationBudget
 from agent.interrupt_compat import request_hard_interrupt
@@ -2684,6 +2686,20 @@ class AIAgent:
 
     @staticmethod
     def _summarize_api_error(error: Exception) -> str:
+        """Return a safe provider error summary with local correlation ID."""
+        summary = AIAgent._summarize_api_error_detail(error)
+        try:
+            from agent.process_bootstrap import request_id_from_error
+
+            request_id = request_id_from_error(error)
+        except Exception:
+            request_id = None
+        if request_id is None:
+            return summary
+        return f"{summary}\nRequest ID: {request_id[1]}"
+
+    @staticmethod
+    def _summarize_api_error_detail(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
         Handles Cloudflare HTML error pages (502, 503, etc.) by pulling the
@@ -5129,48 +5145,18 @@ class AIAgent:
         for its scheme).
         """
         try:
-            import httpx as _httpx
+            from hermes_cli.config import cfg_get, load_config_readonly
 
-            # Explicitly read proxy settings so requests route through
-            # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
-            _proxy = _get_proxy_for_base_url(base_url)
-
-            # Proactive pool reaping: close idle connections at 20 s,
-            # before reverse proxies (30–60 s typical) send FIN and
-            # cause CLOSE-WAIT accumulation.
-            _limits = _httpx.Limits(
-                max_keepalive_connections=20,
-                max_connections=100,
-                keepalive_expiry=20.0,
-            )
-
-            # Timeouts: generous read=None for SSE streaming endpoints.
-            _timeout = _httpx.Timeout(
-                connect=15.0,
-                read=None,
-                write=15.0,
-                pool=10.0,
-            )
-
-            # When _proxy is None (NO_PROXY bypass or no proxy configured),
-            # mount plain transports to prevent httpx from reading env proxy
-            # vars and creating an HTTPProxy mount that would bypass our
-            # NO_PROXY resolution.
-            _mounts = {}
-            if _proxy is None:
-                _mounts = {
-                    "http://": _httpx.HTTPTransport(verify=verify),
-                    "https://": _httpx.HTTPTransport(verify=verify),
-                }
-            return _httpx.Client(
-                limits=_limits,
-                timeout=_timeout,
-                proxy=_proxy,
-                mounts=_mounts or None,
-                verify=verify,
+            request_id_header = normalize_request_id_header(
+                cfg_get(load_config_readonly(), "model", "request_id_header")
             )
         except Exception:
-            return None
+            request_id_header = None
+        return build_keepalive_http_client(
+            base_url,
+            verify=verify,
+            request_id_header=request_id_header,
+        )
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""

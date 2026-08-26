@@ -16649,21 +16649,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and store_profile != "default"
                             else ""
                         )
+                        approval_instruction = (
+                            getattr(
+                                self.config,
+                                "pairing_approval_instruction",
+                                "",
+                            )
+                            or t(
+                                "gateway.pairing_approval_cli",
+                                command=(
+                                    f"hermes {profile_arg}pairing approve "
+                                    f"{platform_name} {code}"
+                                ),
+                            )
+                        )
                         await adapter.send(
                             source.chat_id,
-                            f"Hi~ I don't recognize you yet!\n\n"
-                            f"Here's your pairing code: `{code}`\n\n"
-                            f"Ask the bot owner to run:\n"
-                            f"`hermes {profile_arg}pairing approve "
-                            f"{platform_name} {code}`"
+                            t(
+                                "gateway.pairing_code_notice",
+                                code=code,
+                                approval_instruction=approval_instruction,
+                            ),
                         )
                 else:
                     adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
-                            "Too many pairing requests right now~ "
-                            "Please try again later!"
+                            t("gateway.pairing_rate_limited"),
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
@@ -20042,12 +20055,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.SLACK
                     else "/sethome"
                 )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
+                notice = t(
+                    "gateway.home_channel_notice",
+                    platform=platform_name.title(),
+                    sethome_cmd=sethome_cmd,
                 )
                 await self._deliver_platform_notice(source, notice)
         

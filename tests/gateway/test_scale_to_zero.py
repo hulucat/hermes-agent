@@ -108,7 +108,9 @@ def test_idle_exactly_at_threshold():
 
 
 import os
+from pathlib import Path
 import socket as _socket
+import tempfile
 import threading
 
 
@@ -120,6 +122,13 @@ from gateway.scale_to_zero import (  # noqa: E402 - grouped with their section
 )
 
 _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891234f"}
+
+
+@pytest.fixture
+def short_socket_dir():
+    """Keep AF_UNIX paths below macOS's shorter sockaddr_un limit."""
+    with tempfile.TemporaryDirectory(prefix="h-sz-") as tmp:
+        yield Path(tmp)
 
 
 def _fake_flaps(tmp_path, status_line, capture):
@@ -150,9 +159,9 @@ def _fake_flaps(tmp_path, status_line, capture):
     return sock_path, t
 
 
-def test_suspend_self_posts_suspend_for_this_machine(tmp_path):
+def test_suspend_self_posts_suspend_for_this_machine(short_socket_dir):
     captured: list[bytes] = []
-    sock_path, t = _fake_flaps(tmp_path, "200 OK", captured)
+    sock_path, t = _fake_flaps(short_socket_dir, "200 OK", captured)
     assert suspend_self(_FLY_ENV, socket_path=sock_path) is True
     t.join(timeout=5)
     request = captured[0].decode()
@@ -164,9 +173,9 @@ def test_suspend_self_posts_suspend_for_this_machine(tmp_path):
     assert "Host: flaps\r\n" in request
 
 
-def test_suspend_self_non_2xx_is_false_not_raise(tmp_path):
+def test_suspend_self_non_2xx_is_false_not_raise(short_socket_dir):
     captured: list[bytes] = []
-    sock_path, t = _fake_flaps(tmp_path, "412 Precondition Failed", captured)
+    sock_path, t = _fake_flaps(short_socket_dir, "412 Precondition Failed", captured)
     assert suspend_self(_FLY_ENV, socket_path=sock_path) is False
     t.join(timeout=5)
 

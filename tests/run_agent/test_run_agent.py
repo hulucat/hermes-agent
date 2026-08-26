@@ -3113,6 +3113,7 @@ class TestRunConversation:
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
+        agent.run_id = "run_hook_test"
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
@@ -3145,6 +3146,7 @@ class TestRunConversation:
         assert [call["api_call_count"] for call in pre_request_calls] == [1, 2]
         assert [call["retry_count"] for call in pre_request_calls] == [0, 0]
         assert [call["api_call_count"] for call in post_request_calls] == [1, 2]
+        assert all(call["run_id"] == "run_hook_test" for call in post_request_calls)
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all(call["turn_id"] == pre_request_calls[0]["turn_id"] for call in pre_request_calls + post_request_calls)
         assert [call["api_request_id"] for call in pre_request_calls] == [

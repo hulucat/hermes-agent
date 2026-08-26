@@ -10,6 +10,8 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+from pathlib import Path
+
 import pytest
 
 import cron.scheduler as s
@@ -76,6 +78,30 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_run_one_job_associates_saved_output_with_execution(monkeypatch, tmp_path):
+    calls = _patch_pipeline(monkeypatch)
+    output_root = tmp_path / "cron" / "output"
+    output_file = output_root / "job-output" / "result.md"
+    associated = []
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-output"}
+    )
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "save_job_output", lambda *_a: Path(output_file))
+    monkeypatch.setattr(
+        "cron.jobs.get_cron_output_dir", lambda: output_root
+    )
+    monkeypatch.setattr(
+        s,
+        "set_execution_output",
+        lambda execution_id, output: associated.append((execution_id, output)),
+    )
+
+    assert s.run_one_job({"id": "job-output", "name": "output"}) is True
+    assert associated == [("exec-output", "job-output/result.md")]
+    assert [call[0] for call in calls] == ["run_job", "deliver", "mark"]
 
 
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
@@ -292,5 +318,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-

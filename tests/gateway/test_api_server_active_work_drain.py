@@ -9,6 +9,7 @@ turns once the gateway starts draining.
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -150,7 +151,14 @@ class TestDrainWaitsForApiWork:
             side_effect=delayed_create_task,
         ), patch.object(api, "_create_agent", return_value=mock_agent):
             async with TestClient(TestServer(app)) as client:
-                response = await client.post("/v1/runs", json={"input": "hello"})
+                response = await client.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "workspace_root": str(Path.cwd()),
+                        "mode": "ask",
+                    },
+                )
                 assert response.status == 202
                 await task_started.wait()
 
@@ -604,5 +612,3 @@ class TestShutdownSettleWindow:
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
         ]
-
-

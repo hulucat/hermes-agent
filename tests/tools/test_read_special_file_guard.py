@@ -7,7 +7,9 @@ Without it, read_file on a workspace FIFO blocks until the exec timeout.
 
 import json
 import os
+from pathlib import Path
 import socket
+import tempfile
 
 import pytest
 
@@ -31,14 +33,15 @@ class TestSpecialFileKind:
         os.mkfifo(fifo)
         assert "FIFO" in (_special_file_kind(fifo) or "")
 
-    def test_socket(self, tmp_path):
-        sock_path = tmp_path / "s.sock"
-        s = socket.socket(socket.AF_UNIX)
-        try:
-            s.bind(str(sock_path))
-            assert "socket" in (_special_file_kind(sock_path) or "")
-        finally:
-            s.close()
+    def test_socket(self):
+        with tempfile.TemporaryDirectory(prefix="h-sf-") as tmp:
+            sock_path = Path(tmp) / "s.sock"
+            s = socket.socket(socket.AF_UNIX)
+            try:
+                s.bind(str(sock_path))
+                assert "socket" in (_special_file_kind(sock_path) or "")
+            finally:
+                s.close()
 
     def test_symlink_to_fifo_followed(self, tmp_path):
         fifo = tmp_path / "p.pipe"

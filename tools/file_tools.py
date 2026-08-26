@@ -444,6 +444,32 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         return None
 
 
+def _enforce_within_workspace(filepath: str, task_id: str = "default") -> str | None:
+    """Block writes outside an explicitly registered per-Run workspace."""
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        overrides = resolve_task_overrides(task_id)
+    except Exception:
+        return None
+    workspace_root = overrides.get("cwd") if isinstance(overrides, dict) else None
+    if not workspace_root:
+        return None
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+        from pathlib import PurePosixPath
+
+        # Container paths cannot be dereferenced on the host. Exact type is
+        # required because local PosixPath subclasses PurePosixPath.
+        if type(resolved) is PurePosixPath:
+            return None
+        from tools.path_security import validate_within_dir
+
+        return validate_within_dir(resolved, Path(str(workspace_root)).resolve())
+    except Exception as exc:
+        return f"Unable to validate path against workspace: {exc}"
+
+
 def _file_ops_uses_host_paths(file_ops) -> bool:
     """Return True when *file_ops* targets the same host filesystem as Hermes.
 
@@ -2233,6 +2259,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    workspace_err = _enforce_within_workspace(path, task_id)
+    if workspace_err:
+        return tool_error(workspace_err)
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
@@ -2377,6 +2406,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        workspace_err = _enforce_within_workspace(_p, task_id)
+        if workspace_err:
+            return tool_error(workspace_err)
         if not cross_profile:
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:

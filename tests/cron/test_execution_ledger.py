@@ -39,6 +39,144 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def _create_legacy_ledger(path: Path) -> None:
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at, started_at, finished_at, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    "legacy-completed", "job-a", "builtin", "proc-a", 11, 101,
+                    "completed", "2026-08-25T01:00:00+00:00",
+                    "2026-08-25T01:00:01+00:00",
+                    "2026-08-25T01:00:02+00:00", None,
+                ),
+                (
+                    "legacy-failed", "job-b", "external", "proc-b", 12, 102,
+                    "failed", "2026-08-25T02:00:00+00:00",
+                    "2026-08-25T02:00:01+00:00",
+                    "2026-08-25T02:00:02+00:00", "legacy error",
+                ),
+            ],
+        )
+
+
+def test_legacy_ledger_migration_preserves_all_data(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _create_legacy_ledger(executions.EXECUTIONS_FILE)
+
+    records = executions.list_executions(limit=10)
+
+    assert {record["id"] for record in records} == {
+        "legacy-completed",
+        "legacy-failed",
+    }
+    failed = next(record for record in records if record["id"] == "legacy-failed")
+    assert failed["source"] == "external"
+    assert failed["started_at"] == "2026-08-25T02:00:01+00:00"
+    assert failed["finished_at"] == "2026-08-25T02:00:02+00:00"
+    assert failed["error"] == "legacy error"
+    assert failed["output_file"] is None
+
+    skipped = executions.record_skipped_execution(
+        "job-c", reason="stopped", idempotency_key="slot-1"
+    )
+    assert skipped["status"] == "skipped"
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='executions'"
+        ).fetchone()[0]
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+    assert "'skipped'" in schema
+    assert "output_file" in schema
+    assert "idx_executions_job_claimed" in indexes
+    assert "idx_executions_status_claimed" in indexes
+
+
+def test_legacy_ledger_migration_failure_rolls_back_original_table(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _create_legacy_ledger(executions.EXECUTIONS_FILE)
+
+    original_create = executions._create_execution_table
+
+    def create_then_fail(conn):
+        original_create(conn)
+        raise sqlite3.OperationalError("simulated migration failure")
+
+    monkeypatch.setattr(executions, "_create_execution_table", create_then_fail)
+    with __import__("pytest").raises(
+        sqlite3.OperationalError, match="simulated migration failure"
+    ):
+        executions.list_executions()
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        rows = conn.execute(
+            "SELECT id, status, error FROM executions ORDER BY id"
+        ).fetchall()
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(executions)")
+        }
+    assert tables == {"executions"}
+    assert rows == [
+        ("legacy-completed", "completed", None),
+        ("legacy-failed", "failed", "legacy error"),
+    ]
+    assert "output_file" not in columns
+
+
+def test_skipped_execution_is_idempotent_and_output_is_associated(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    first = executions.record_skipped_execution(
+        "job-skip", reason="first reason", idempotency_key="slot-1"
+    )
+    second = executions.record_skipped_execution(
+        "job-skip", reason="replacement reason", idempotency_key="slot-1"
+    )
+    assert second == first
+    assert executions.list_executions(job_id="job-skip") == [first]
+
+    running = executions.create_execution("job-output", source="builtin")
+    associated = executions.set_execution_output(
+        running["id"], "job-output/2026-08-26_12-00-00.md"
+    )
+    assert associated["output_file"] == "job-output/2026-08-26_12-00-00.md"
+
+
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
     import cron.executions as executions
 

@@ -22,7 +22,7 @@ from hermes_time import now as _hermes_now
 # profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+_TERMINAL_STATES = ("completed", "failed", "unknown", "skipped")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -33,15 +33,10 @@ def _connect() -> sqlite3.Connection:
     return sqlite3.connect(path, timeout=5)
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
-
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    apply_wal_with_fallback(conn, db_label="cron/executions.db")
-    conn.execute("PRAGMA synchronous=FULL")
+def _create_execution_table(conn: sqlite3.Connection) -> None:
+    """Create the current execution ledger table in an empty schema."""
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
+        """CREATE TABLE executions (
              id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
@@ -49,13 +44,90 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
+               ('claimed','running','completed','failed','unknown','skipped')),
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             output_file TEXT
            )"""
     )
+
+
+def _migrate_execution_table_if_needed(conn: sqlite3.Connection) -> None:
+    """Atomically add skipped/output_file while preserving every legacy row."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    schema = str(row["sql"] or "") if row is not None else ""
+    if "'skipped'" in schema and "output_file" in schema:
+        return
+
+    legacy_columns = {
+        item["name"] for item in conn.execute("PRAGMA table_info(executions)")
+    }
+    columns = [
+        "id",
+        "job_id",
+        "source",
+        "process_id",
+        "pid",
+        "process_started_at",
+        "status",
+        "claimed_at",
+        "started_at",
+        "finished_at",
+        "error",
+    ]
+    source_columns = columns + (
+        ["output_file"] if "output_file" in legacy_columns else ["NULL"]
+    )
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        source_count = conn.execute(
+            "SELECT COUNT(*) FROM executions"
+        ).fetchone()[0]
+        conn.execute("DROP INDEX IF EXISTS idx_executions_job_claimed")
+        conn.execute("DROP INDEX IF EXISTS idx_executions_status_claimed")
+        conn.execute("ALTER TABLE executions RENAME TO executions_legacy")
+        _create_execution_table(conn)
+        conn.execute(
+            "INSERT INTO executions ("
+            + ", ".join(columns + ["output_file"])
+            + ") SELECT "
+            + ", ".join(source_columns)
+            + " FROM executions_legacy"
+        )
+        target_count = conn.execute(
+            "SELECT COUNT(*) FROM executions"
+        ).fetchone()[0]
+        if target_count != source_count:
+            raise sqlite3.IntegrityError(
+                "execution ledger migration row-count mismatch"
+            )
+        conn.execute("DROP TABLE executions_legacy")
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_state import apply_wal_with_fallback
+
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    apply_wal_with_fallback(conn, db_label="cron/executions.db")
+    conn.execute("PRAGMA synchronous=FULL")
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    if table_exists is None:
+        _create_execution_table(conn)
+    else:
+        _migrate_execution_table_if_needed(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -129,7 +201,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','unknown','skipped')
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
@@ -198,6 +270,67 @@ def finish_execution(
         ).fetchone())
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
+
+
+def set_execution_output(
+    execution_id: str, output_file: str
+) -> Optional[Dict[str, Any]]:
+    """Attach one profile-relative cron/output path to its execution."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET output_file=?
+               WHERE id=? AND status IN ('claimed','running','completed','failed')""",
+            (str(output_file), execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+
+
+def record_skipped_execution(
+    job_id: str,
+    *,
+    reason: str,
+    source: str = "workmate",
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Append an immutable skipped attempt, idempotently when keyed."""
+    now = _hermes_now().isoformat()
+    if idempotency_key:
+        execution_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes-cron-skipped:{job_id}:{idempotency_key}",
+        ).hex
+    else:
+        execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at, finished_at, error)
+               VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, ?, ?)""",
+            (
+                execution_id,
+                str(job_id),
+                str(source),
+                _PROCESS_ID,
+                pid,
+                _process_start_time(pid),
+                now,
+                now,
+                str(reason),
+            ),
+        )
+        _prune_unlocked(conn)
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    record = _record(row)
+    _emit_execution_state(record)
+    return record  # type: ignore[return-value]
 
 
 def recover_interrupted_executions() -> int:

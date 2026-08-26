@@ -92,12 +92,17 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.memory_manager import sanitize_context
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+MAX_RUN_REASONING_SEGMENT_CHARS = 32_000
+MAX_RUN_REASONING_CHARS = 128_000
 
 
 def _get_scoped_secret(name, default=None):
@@ -217,6 +222,9 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+_WORKMATE_BRIDGE_SCRIPT_RE = re.compile(
+    r"^workmate-automation-[0-9a-f]{32}\.py$"
+)
 
 
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
@@ -1444,6 +1452,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Per-Run resolved-model state is loop-owned. The lifecycle hook only
+        # schedules into the owning loop; sequence assignment, SSE and DB task
+        # creation happen together there so concurrent Runs cannot collide.
+        self._run_model_contexts: Dict[str, Dict[str, Any]] = {}
+        self._model_usage_hook_managers: Dict[int, Any] = {}
+        self._model_usage_hook_lock = threading.Lock()
+        self._model_usage_hook_callback = self._dispatch_model_usage_hook
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -2102,6 +2117,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+            ("GET", "/v1/runs/{run_id}/model-usage", self._handle_run_model_usage),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
@@ -5750,6 +5766,14 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            workmate_bridge = body.get("workmate_bridge") is True
+            if ("script" in body or "no_agent" in body) and not workmate_bridge:
+                return web.json_response(
+                    {"error": "script and no_agent require WorkMate bridge"},
+                    status=400,
+                )
+            script = body.get("script") if workmate_bridge else None
+            no_agent = body.get("no_agent") if workmate_bridge else False
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -5769,6 +5793,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            if workmate_bridge:
+                if not isinstance(script, str) or not _WORKMATE_BRIDGE_SCRIPT_RE.fullmatch(
+                    script
+                ):
+                    return web.json_response(
+                        {"error": "Invalid WorkMate bridge script"}, status=400
+                    )
+                if no_agent is not True:
+                    return web.json_response(
+                        {"error": "WorkMate bridge requires no_agent=true"},
+                        status=400,
+                    )
 
             kwargs = {
                 "prompt": prompt,
@@ -5781,6 +5817,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if workmate_bridge:
+                kwargs["script"] = script
+                kwargs["no_agent"] = True
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
@@ -5822,9 +5861,31 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             body = await request.json()
             # Whitelist allowed fields to prevent arbitrary key injection
-            sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
+            workmate_bridge = body.get("workmate_bridge") is True
+            if ("script" in body or "no_agent" in body) and not workmate_bridge:
+                return web.json_response(
+                    {"error": "script and no_agent require WorkMate bridge"},
+                    status=400,
+                )
+            allowed_fields = self._UPDATE_ALLOWED_FIELDS | (
+                {"script", "no_agent"} if workmate_bridge else set()
+            )
+            sanitized = {k: v for k, v in body.items() if k in allowed_fields}
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
+            if workmate_bridge:
+                script = sanitized.get("script")
+                if not isinstance(script, str) or not _WORKMATE_BRIDGE_SCRIPT_RE.fullmatch(
+                    script
+                ):
+                    return web.json_response(
+                        {"error": "Invalid WorkMate bridge script"}, status=400
+                    )
+                if sanitized.get("no_agent") is not True:
+                    return web.json_response(
+                        {"error": "WorkMate bridge requires no_agent=true"},
+                        status=400,
+                    )
             # Validate lengths if present
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
                 return web.json_response(
@@ -6585,9 +6646,162 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
+    def _register_model_usage_hook(self) -> None:
+        """Register this adapter once with the active profile plugin manager."""
+        try:
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            discover_plugins()
+            manager = get_plugin_manager()
+            with self._model_usage_hook_lock:
+                callbacks = manager._hooks.setdefault("post_api_request", [])
+                if self._model_usage_hook_callback not in callbacks:
+                    callbacks.append(self._model_usage_hook_callback)
+                self._model_usage_hook_managers[id(manager)] = manager
+        except Exception:
+            logger.debug("post_api_request model usage hook registration failed", exc_info=True)
+
+    def _unregister_model_usage_hooks(self) -> None:
+        """Remove adapter-owned callbacks without disturbing plugin hooks."""
+        lock = getattr(self, "_model_usage_hook_lock", None)
+        registered = getattr(self, "_model_usage_hook_managers", None)
+        owned_callback = getattr(self, "_model_usage_hook_callback", None)
+        if lock is None or registered is None or owned_callback is None:
+            return
+
+        with lock:
+            managers = list(registered.values())
+            registered.clear()
+        for manager in managers:
+            callbacks = manager._hooks.get("post_api_request", [])
+            manager._hooks["post_api_request"] = [
+                callback
+                for callback in callbacks
+                if callback != owned_callback
+            ]
+
+    def _dispatch_model_usage_hook(
+        self,
+        *,
+        run_id: object = None,
+        response_model: object = None,
+        session_id: object = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Cross from the agent worker into the Run's event-loop sink."""
+        if not isinstance(run_id, str) or not isinstance(response_model, str):
+            return
+        model = response_model.strip()
+        context = self._run_model_contexts.get(run_id)
+        if not model or context is None:
+            return
+        loop = context.get("loop")
+        try:
+            loop.call_soon_threadsafe(
+                self._record_model_used_on_loop,
+                run_id,
+                model,
+                str(session_id or context["session_id"]),
+            )
+        except Exception:
+            logger.debug("model.used scheduling failed for %s", run_id, exc_info=True)
+
+    def _record_model_used_on_loop(
+        self,
+        run_id: str,
+        resolved_model: str,
+        session_id: str,
+    ) -> None:
+        """Assign one model-call sequence and fan the same record to both sinks."""
+        context = self._run_model_contexts.get(run_id)
+        if context is None:
+            return
+        context["seq"] += 1
+        timestamp = str(time.time())
+        record = {
+            "run_id": run_id,
+            "session_id": session_id or context["session_id"],
+            "seq": context["seq"],
+            "resolved_model": resolved_model,
+            "reason": "api",
+            "timestamp": timestamp,
+        }
+
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            q.put_nowait({
+                "event": "model.used",
+                "run_id": run_id,
+                "seq": record["seq"],
+                "model": resolved_model,
+                "timestamp": timestamp,
+            })
+
+        db = context.get("db")
+        if db is None:
+            return
+
+        async def _persist() -> None:
+            try:
+                await asyncio.to_thread(
+                    db.record_run_model_usage,
+                    record["run_id"],
+                    record["session_id"],
+                    record["seq"],
+                    record["resolved_model"],
+                    reason=record["reason"],
+                    timestamp=record["timestamp"],
+                )
+            except Exception:
+                logger.warning(
+                    "run_model_usage write failed for %s", run_id, exc_info=True
+                )
+
+        task = asyncio.create_task(_persist())
+        context["persist_tasks"].add(task)
+        task.add_done_callback(context["persist_tasks"].discard)
+
+    async def _drain_run_model_usage(self, run_id: str) -> None:
+        """Wait for model records scheduled before a Run terminal boundary."""
+        context = self._run_model_contexts.get(run_id)
+        while context is not None and context["persist_tasks"]:
+            pending = tuple(context["persist_tasks"])
+            await asyncio.gather(*pending)
+            context["persist_tasks"].difference_update(pending)
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        *,
+        workspace_root: str | None = None,
+        before_event=None,
+    ):
+        """Project tool progress into loop-owned, sanitized Run events."""
+        workspace_path = Path(workspace_root) if workspace_root else None
+
+        def _workspace_relative_file_paths(raw_paths: object) -> list[str]:
+            if workspace_path is None or not isinstance(raw_paths, list):
+                return []
+            relative_paths: list[str] = []
+            for raw_path in raw_paths:
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                candidate = Path(raw_path).expanduser()
+                candidate = candidate if candidate.is_absolute() else workspace_path / candidate
+                try:
+                    relative = candidate.resolve(strict=False).relative_to(
+                        workspace_path
+                    ).as_posix()
+                except (OSError, ValueError):
+                    continue
+                if relative and relative != "." and relative not in relative_paths:
+                    relative_paths.append(relative)
+            return relative_paths
+
+        def _push_on_loop(event: Dict[str, Any]) -> None:
+            if before_event is not None:
+                before_event()
             self._set_run_status(
                 run_id,
                 self._run_statuses.get(run_id, {}).get("status", "running"),
@@ -6597,7 +6811,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if q is None:
                 return
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+        def _push(event: Dict[str, Any]) -> None:
+            try:
+                loop.call_soon_threadsafe(_push_on_loop, event)
             except Exception:
                 pass
 
@@ -6612,6 +6832,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                file_paths = _workspace_relative_file_paths(kwargs.get("file_paths"))
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -6619,6 +6840,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "file_paths": file_paths,
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -6696,6 +6918,39 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        if "include_reasoning" in body and not isinstance(body["include_reasoning"], bool):
+            return web.json_response(
+                _openai_error("'include_reasoning' must be a boolean"), status=400
+            )
+        include_reasoning = body.get("include_reasoning", False)
+
+        raw_workspace_root = body.get("workspace_root")
+        if not isinstance(raw_workspace_root, str) or not raw_workspace_root.strip():
+            return web.json_response(
+                _openai_error("'workspace_root' must be a non-empty absolute path"),
+                status=400,
+            )
+        workspace_path = Path(raw_workspace_root).expanduser()
+        if not workspace_path.is_absolute() or not workspace_path.is_dir():
+            return web.json_response(
+                _openai_error("'workspace_root' must be an existing absolute directory"),
+                status=400,
+            )
+        try:
+            workspace_root = str(workspace_path.resolve(strict=True))
+        except OSError:
+            return web.json_response(
+                _openai_error("'workspace_root' must be an existing absolute directory"),
+                status=400,
+            )
+
+        wm_mode = body.get("mode")
+        if wm_mode not in {"ask", "craft", "plan"}:
+            return web.json_response(
+                _openai_error("'mode' must be one of: ask, craft, plan"),
+                status=400,
+            )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6781,12 +7036,101 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
-
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
+
+        reasoning_state = {
+            "parts": [],
+            "segment_seq": 0,
+            "segment_chars": 0,
+            "run_chars": 0,
+            "started": False,
+            "truncated": False,
+        }
+
+        def _append_reasoning_on_loop(delta: object) -> None:
+            if not include_reasoning or self._run_streams.get(run_id) is not q:
+                return
+            text = str(delta or "")
+            if not text:
+                return
+            available = min(
+                MAX_RUN_REASONING_SEGMENT_CHARS - reasoning_state["segment_chars"],
+                MAX_RUN_REASONING_CHARS - reasoning_state["run_chars"],
+            )
+            if available <= 0:
+                if reasoning_state["started"]:
+                    reasoning_state["truncated"] = True
+                return
+            accepted = text[:available]
+            if not reasoning_state["started"]:
+                reasoning_state["started"] = True
+                reasoning_state["segment_seq"] += 1
+                _put_event_if_active({
+                    "event": "reasoning.started",
+                    "run_id": run_id,
+                    "segment_seq": reasoning_state["segment_seq"],
+                    "timestamp": time.time(),
+                })
+            reasoning_state["parts"].append(accepted)
+            reasoning_state["segment_chars"] += len(accepted)
+            reasoning_state["run_chars"] += len(accepted)
+            if len(accepted) < len(text):
+                reasoning_state["truncated"] = True
+
+        def _flush_reasoning_on_loop() -> None:
+            if not include_reasoning or not reasoning_state["started"]:
+                return
+            raw_text = "".join(reasoning_state["parts"])
+            text = redact_sensitive_text(
+                sanitize_context(raw_text),
+                force=True,
+                redact_url_credentials=True,
+            )
+            _put_event_if_active({
+                "event": "reasoning.completed",
+                "run_id": run_id,
+                "segment_seq": reasoning_state["segment_seq"],
+                "text": text,
+                "truncated": reasoning_state["truncated"],
+                "timestamp": time.time(),
+            })
+            reasoning_state["parts"] = []
+            reasoning_state["segment_chars"] = 0
+            reasoning_state["started"] = False
+            reasoning_state["truncated"] = False
+
+        def _reasoning_cb(delta: Optional[str]) -> None:
+            if delta is None or not include_reasoning:
+                return
+            try:
+                loop.call_soon_threadsafe(_append_reasoning_on_loop, delta)
+            except Exception:
+                pass
+
+        message_state = {"seq": 0}
+
+        def _append_text_on_loop(delta: str) -> None:
+            if self._run_streams.get(run_id) is not q:
+                return
+            _flush_reasoning_on_loop()
+            message_state["seq"] += 1
+            _put_event_if_active({
+                "event": "message.delta",
+                "run_id": run_id,
+                "seq": message_state["seq"],
+                "timestamp": time.time(),
+                "delta": delta,
+            })
+
+        event_cb = self._make_run_event_callback(
+            run_id,
+            loop,
+            workspace_root=workspace_root,
+            before_event=_flush_reasoning_on_loop if include_reasoning else None,
+        )
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -6795,12 +7139,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if run_id not in self._run_streams:
                 return
             try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
+                loop.call_soon_threadsafe(_append_text_on_loop, delta)
             except Exception:
                 pass
 
@@ -6842,8 +7181,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        **(
+                            {"reasoning_callback": _reasoning_cb}
+                            if include_reasoning
+                            else {}
+                        ),
                     )
+                    run_db = self._ensure_session_db()
+                    self._register_model_usage_hook()
                 self._active_run_agents[run_id] = agent
+                agent.run_id = run_id
+                self._run_model_contexts[run_id] = {
+                    "loop": loop,
+                    "session_id": session_id,
+                    "db": run_db,
+                    "seq": 0,
+                    "persist_tasks": set(),
+                }
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
@@ -6859,10 +7213,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
+                        "choices": ["session", "deny"],
                     })
                     self._set_run_status(
                         run_id,
@@ -6883,9 +7234,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
-                    effective_task_id = session_id or run_id
+                    # A conversation session may have concurrent Runs. Tool,
+                    # cwd, mode and container override state must remain Run-local.
+                    effective_task_id = run_id
                     approval_token = None
                     session_tokens = []
+                    task_env = {"cwd": workspace_root, "wm_mode": wm_mode}
+                    from tools.terminal_tool import register_task_env_overrides
+
+                    register_task_env_overrides(effective_task_id, task_env)
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -6906,6 +7263,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            from agent.runtime_cwd import set_session_cwd
+
+                            set_session_cwd(workspace_root)
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
@@ -6923,6 +7283,18 @@ class APIServerAdapter(BasePlatformAdapter):
                             # run deliberately left running (same race-window
                             # guard as gateway/run.py and _run_agent above).
                             _clear_turn_process_ownership(agent)
+                            try:
+                                from tools.terminal_tool import clear_task_env_overrides
+
+                                clear_task_env_overrides(effective_task_id)
+                            except Exception:
+                                pass
+                            try:
+                                from agent.runtime_cwd import clear_session_cwd
+
+                                clear_session_cwd()
+                            except Exception:
+                                pass
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
@@ -6944,6 +7316,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                # Drain callbacks scheduled from the executor before emitting
+                # the terminal boundary and flushing the last reasoning segment.
+                await asyncio.sleep(0)
+                await self._drain_run_model_usage(run_id)
+                _flush_reasoning_on_loop()
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -6997,6 +7374,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
             except asyncio.CancelledError:
+                await self._drain_run_model_usage(run_id)
+                _flush_reasoning_on_loop()
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -7012,6 +7391,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 raise
             except _ProviderAuthResolutionError as exc:
+                await self._drain_run_model_usage(run_id)
+                _flush_reasoning_on_loop()
                 # /v1/runs builds its own agent via _create_agent() and does
                 # not route through _run_agent() (see that method's own
                 # _ProviderAuthResolutionError branch), so it needs its own
@@ -7037,6 +7418,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             except Exception as exc:
+                await self._drain_run_model_usage(run_id)
+                _flush_reasoning_on_loop()
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
                     run_id,
@@ -7073,6 +7456,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_model_contexts.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -7108,6 +7492,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
         return web.json_response(status)
+
+    async def _handle_run_model_usage(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Return persisted resolved-model calls for one Run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response([])
+        rows = await asyncio.to_thread(
+            db.get_run_model_usage,
+            request.match_info["run_id"],
+        )
+        return web.json_response(rows)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -7181,13 +7582,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_choice = str(body.get("choice", "")).strip().lower()
-        aliases = {"approve": "once", "approved": "once", "allow": "once"}
-        choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
+        choice = raw_choice
+        allowed = {"session", "deny"}
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    "Invalid approval choice; expected one of: session, deny",
                     code="invalid_approval_choice",
                 ),
                 status=400,
@@ -7620,6 +8020,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
         finally:
+            self._unregister_model_usage_hooks()
             self._close_cached_session_dbs()
             self._app = None
         logger.info("[%s] API server stopped", self.name)

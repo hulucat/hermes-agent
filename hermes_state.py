@@ -7818,6 +7818,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def record_run_model_usage(
+        self,
+        run_id: str,
+        session_id: str,
+        seq: int,
+        resolved_model: str,
+        *,
+        reason: str = "api",
+        timestamp: Optional[str] = None,
+    ) -> None:
+        """Persist one resolved upstream model call for a WorkMate Run."""
+        recorded_at = timestamp or str(time.time())
+
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO run_model_usage "
+                "(run_id, session_id, seq, resolved_model, reason, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, session_id, seq, resolved_model, reason, recorded_at),
+            )
+
+        self._execute_write(_do)
+
+    def get_run_model_usage(self, run_id: str) -> List[Dict[str, Any]]:
+        """Return resolved model calls for one Run in stable call order."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT run_id, session_id, seq, resolved_model, reason, timestamp "
+                "FROM run_model_usage WHERE run_id = ? ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
         cutoff = time.time() - 86400  # Only sessions older than 24 hours

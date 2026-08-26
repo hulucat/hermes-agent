@@ -641,6 +641,17 @@ class TestLoadGatewayConfig:
 
         assert config.unauthorized_dm_behavior == "ignore"
 
+    def test_pairing_instruction_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  pairing_approval_instruction: 请在 HLMate 中批准。\n",
+            encoding="utf-8",
+        )
+
+        config = load_gateway_config()
+
+        assert config.pairing_approval_instruction == "请在 HLMate 中批准。"
+
 
     def test_present_empty_top_level_session_reset_blocks_nested_fallback(self, tmp_path, monkeypatch):
         """Key-presence precedence: a present (even empty) top-level

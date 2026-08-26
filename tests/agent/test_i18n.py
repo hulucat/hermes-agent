@@ -120,6 +120,26 @@ def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatc
         i18n.reset_language_cache()
 
 
+def test_pairing_and_home_notices_are_localized():
+    pairing = i18n.t(
+        "gateway.pairing_code_notice",
+        lang="zh",
+        code="JWK7BGMG",
+        approval_instruction="请在 HLMate 中批准。",
+    )
+    home = i18n.t(
+        "gateway.home_channel_notice",
+        lang="zh",
+        platform="Dingtalk",
+        sethome_cmd="/sethome",
+    )
+    assert "暂未获得使用授权" in pairing
+    assert "JWK7BGMG" in pairing
+    assert "请在 HLMate 中批准" in pairing
+    assert "主会话" in home
+    assert "/sethome" in home
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -138,5 +158,4 @@ def test_locales_dir_env_override_ignored_when_missing(tmp_path, monkeypatch):
     assert result != tmp_path / "does-not-exist"
     # In a source checkout this is the repo-root locales dir.
     assert result.name == "locales"
-
 

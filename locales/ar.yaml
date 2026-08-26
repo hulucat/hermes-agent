@@ -25,6 +25,10 @@ approval:
   blocklist_message: "هذا الأمر مدرج في قائمة الحظر غير المشروطة ولا يمكن الموافقة عليه."
 
 gateway:
+  pairing_code_notice: "مرحبًا، لم يتم التعرف عليك بعد.\n\nرمز الاقتران: `{code}`\n\n{approval_instruction}"
+  pairing_approval_cli: "اطلب من مالك الروبوت تشغيل:\n`{command}`"
+  pairing_rate_limited: "طلبات الاقتران كثيرة جدًا الآن. يرجى المحاولة لاحقًا."
+  home_channel_notice: "📬 لم يتم تعيين قناة رئيسية لهذه المنصة. يرسل Hermes إليها نتائج المهام المجدولة والرسائل بين المنصات.\n\nاكتب {sethome_cmd} لجعل هذه المحادثة قناتك الرئيسية، أو تجاهل هذا التنبيه."
   context:
     header:                "🧠 **Context Window**"
     model:                 "Model: `{model}`"

@@ -24,6 +24,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
+    skip_missed_jobs,
     _hermes_now,
 )
 
@@ -576,6 +577,60 @@ class TestAdvanceNextRun:
 
         updated = get_job(job["id"])
         assert updated["next_run_at"] == original_next, "one-shot next_run_at should be unchanged"
+
+
+class TestSkipMissedJobs:
+    def test_skips_recurring_and_one_shot_idempotently(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        now = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        import cron.executions as executions
+
+        monkeypatch.setattr(
+            executions,
+            "EXECUTIONS_FILE",
+            tmp_cron_dir / "cron" / "executions.db",
+        )
+        recurring = create_job(prompt="Recurring", schedule="every 5m")
+        oneshot = create_job(prompt="Once", schedule="30m")
+        jobs = load_jobs()
+        for job in jobs:
+            job["next_run_at"] = (now - timedelta(minutes=10)).isoformat()
+        save_jobs(jobs)
+
+        result = skip_missed_jobs((now - timedelta(hours=1)).isoformat())
+
+        assert result == {"recurring": 1, "oneshot": 1, "total": 2}
+        recurring_after = get_job(recurring["id"])
+        assert recurring_after["enabled"] is True
+        assert recurring_after["state"] == "scheduled"
+        assert datetime.fromisoformat(recurring_after["next_run_at"]) > now
+        assert recurring_after["last_skipped_at"] == now.isoformat()
+        oneshot_after = get_job(oneshot["id"])
+        assert oneshot_after["enabled"] is False
+        assert oneshot_after["state"] == "missed"
+        assert oneshot_after["next_run_at"] is None
+
+        assert skip_missed_jobs((now - timedelta(hours=1)).isoformat()) == {
+            "recurring": 0,
+            "oneshot": 0,
+            "total": 0,
+        }
+        records = executions.list_executions(limit=10)
+        assert len(records) == 2
+        assert {record["status"] for record in records} == {"skipped"}
+
+    def test_rejects_future_after_without_writing(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Recurring", schedule="every 5m")
+        before = get_job(job["id"])
+
+        with pytest.raises(ValueError, match="must not be in the future"):
+            skip_missed_jobs((now + timedelta(seconds=1)).isoformat())
+
+        assert get_job(job["id"]) == before
 
 
     def test_crash_safety_scenario(self, tmp_cron_dir):

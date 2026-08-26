@@ -278,6 +278,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
+    cron_skip_missed = cron_subparsers.add_parser(
+        "skip-missed",
+        help="Mark work missed during a deliberate scheduler stop without catch-up",
+    )
+    cron_skip_missed.add_argument(
+        "--after",
+        required=True,
+        help="ISO 8601 timestamp at which the scheduler was deliberately stopped",
+    )
+
     # cron notepad — per-job durable KV scratchpad (injected into the job
     # prompt each run; the running agent writes it via this CLI).
     cron_notepad = cron_subparsers.add_parser(

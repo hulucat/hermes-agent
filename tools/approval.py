@@ -2307,9 +2307,21 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    configured_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(configured_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    if os.path.normpath(operand) != operand:
+        return False
+
+    operand_dir = os.path.dirname(operand)
+    allowed_dirs = {temp_dir}
+    if (
+        sys.platform == "darwin"
+        and configured_temp_dir == "/tmp"
+        and temp_dir == "/private/tmp"
+    ):
+        allowed_dirs.add("/tmp")
+    if operand_dir not in allowed_dirs:
         return False
 
     target = os.path.realpath(operand)

@@ -180,7 +180,18 @@ model:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
 
-        from agent.auxiliary_client import resolve_vision_provider_client
+        from agent import auxiliary_client
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_main_model_supports_vision",
+            lambda _provider, _model: False,
+        )
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_resolve_strict_vision_backend",
+            lambda *_args, **_kwargs: (None, None),
+        )
+        resolve_vision_provider_client = auxiliary_client.resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is None, (
             f"Vision auto-detect must skip text-only main {provider!r} when "
@@ -198,7 +209,13 @@ model:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         _fresh_modules()
 
-        from agent.auxiliary_client import resolve_vision_provider_client
+        from agent import auxiliary_client
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_try_anthropic",
+            lambda explicit_api_key=None: (object(), "claude-sonnet-4-6"),
+        )
+        resolve_vision_provider_client = auxiliary_client.resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is not None
         assert provider == "anthropic"

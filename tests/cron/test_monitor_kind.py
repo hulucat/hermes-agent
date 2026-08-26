@@ -49,6 +49,18 @@ def hermes_env(tmp_path, monkeypatch):
     import cron.scheduler
     importlib.reload(cron.scheduler)
 
+    from hermes_cli import runtime_provider
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kw: {
+            "provider": "test",
+            "api_key": "k",
+            "base_url": "http://test.local",
+            "api_mode": "chat_completions",
+        },
+    )
+
     return home
 
 

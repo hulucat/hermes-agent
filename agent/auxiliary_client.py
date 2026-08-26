@@ -225,11 +225,20 @@ def _openai_http_client_kwargs(
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
     try:
-        from agent.process_bootstrap import build_keepalive_http_client
+        from agent.process_bootstrap import (
+            build_keepalive_http_client,
+            normalize_request_id_header,
+        )
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        request_id_header = normalize_request_id_header(
+            cfg_get(load_config_readonly(), "model", "request_id_header")
+        )
         client = build_keepalive_http_client(
             str(base_url or ""),
             async_mode=async_mode,
             verify=_resolve_aux_verify(base_url),
+            request_id_header=request_id_header,
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves

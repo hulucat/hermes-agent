@@ -33,8 +33,9 @@ _MOCK_VALIDATION = {
 
 
 @pytest.fixture(autouse=True)
-def _disable_live_custom_provider_model_probe(monkeypatch):
+def _disable_live_custom_provider_model_probe(monkeypatch, tmp_path):
     """Keep custom-provider picker fixtures independent of local model servers."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         "hermes_cli.models.cached_provider_model_ids", lambda *_a, **_kw: []

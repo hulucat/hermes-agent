@@ -987,6 +987,9 @@ class GatewayConfig:
 
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    # Host-specific user guidance shown after a pairing code. Empty uses the
+    # localized Hermes CLI instruction. This is behavioral config, not a secret.
+    pairing_approval_instruction: str = ""
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -1125,6 +1128,7 @@ class GatewayConfig:
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
+            "pairing_approval_instruction": self.pairing_approval_instruction,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -1237,6 +1241,9 @@ class GatewayConfig:
             data.get("unauthorized_dm_behavior"),
             "pair",
         )
+        pairing_approval_instruction = data.get("pairing_approval_instruction")
+        if not isinstance(pairing_approval_instruction, str):
+            pairing_approval_instruction = ""
 
         try:
             session_store_max_age_days = int(data.get("session_store_max_age_days", 90))
@@ -1271,6 +1278,7 @@ class GatewayConfig:
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
+            pairing_approval_instruction=pairing_approval_instruction.strip(),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
@@ -1489,6 +1497,14 @@ def load_gateway_config() -> GatewayConfig:
                     gateway_section.get("unauthorized_dm_behavior"),
                     "pair",
                 )
+
+            pairing_instruction = (
+                gateway_section.get("pairing_approval_instruction")
+                if isinstance(gateway_section, dict)
+                else None
+            )
+            if isinstance(pairing_instruction, str):
+                gw_data["pairing_approval_instruction"] = pairing_instruction
 
             # Merge platform config into gw_data so runtime-only settings under
             # ``gateway.platforms`` are loaded the same way as top-level

@@ -114,6 +114,11 @@ model:
   # default_headers:
   #   User-Agent: "curl/8.7.1"
   #
+  # request_id_header: optional HTTP header name. Hermes assigns a new UUID4
+  #   on every actual OpenAI-compatible HTTP attempt. Do not put this header
+  #   in default_headers, where one static value would be reused.
+  # request_id_header: "X-Request-Id"
+  #
   # extra_headers: accepted as an alias of default_headers (merged, with
   #   extra_headers winning when both are set) — matches the per-provider
   #   extra_headers key below.

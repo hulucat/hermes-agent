@@ -184,6 +184,92 @@ class TestCreateJob:
                 data = await resp.json()
                 assert "5000" in data["error"] or "Prompt" in data["error"]
 
+    @pytest.mark.asyncio
+    async def test_script_fields_require_workmate_bridge(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "script": "workmate-automation-0123456789abcdef0123456789abcdef.py",
+                    "no_agent": True,
+                })
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_workmate_bridge_accepts_only_exact_script_shape(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        valid_script = "workmate-automation-0123456789abcdef0123456789abcdef.py"
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "workmate_bridge": True,
+                    "script": valid_script,
+                    "no_agent": True,
+                })
+
+        assert resp.status == 200
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["script"] == valid_script
+        assert kwargs["no_agent"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("script", [
+        "workmate-automation-0123456789ABCDEF0123456789ABCDEF.py",
+        "workmate-automation-0123456789abcdef.py",
+        "../workmate-automation-0123456789abcdef0123456789abcdef.py",
+        "other-0123456789abcdef0123456789abcdef.py",
+    ])
+    async def test_workmate_bridge_rejects_invalid_script_names(
+        self, adapter, script
+    ):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "workmate_bridge": True,
+                    "script": script,
+                    "no_agent": True,
+                })
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_workmate_bridge_requires_no_agent_true(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "workmate_bridge": True,
+                    "script": "workmate-automation-0123456789abcdef0123456789abcdef.py",
+                    "no_agent": False,
+                })
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 8-10. test_get_job
@@ -240,6 +326,31 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_workmate_bridge_passes_controlled_fields(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        script = "workmate-automation-0123456789abcdef0123456789abcdef.py"
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={
+                        "workmate_bridge": True,
+                        "script": script,
+                        "no_agent": True,
+                        "evil_field": "ignored",
+                    },
+                )
+
+        assert resp.status == 200
+        mock_update.assert_called_once_with(
+            VALID_JOB_ID,
+            {"script": script, "no_agent": True},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -497,4 +608,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

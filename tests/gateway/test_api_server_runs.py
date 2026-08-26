@@ -10,8 +10,10 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    MAX_RUN_REASONING_SEGMENT_CHARS,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -69,10 +72,23 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_get(
+        "/v1/runs/{run_id}/model-usage", adapter._handle_run_model_usage
+    )
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+def _run_body(**fields):
+    body = {
+        "input": "hello",
+        "workspace_root": str(Path.cwd()),
+        "mode": "ask",
+    }
+    body.update(fields)
+    return body
 
 
 def _make_slow_agent(**kwargs):
@@ -123,6 +139,46 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body,error_field",
+        [
+            ({"input": "hello", "mode": "ask"}, "workspace_root"),
+            (
+                {"input": "hello", "workspace_root": "relative", "mode": "ask"},
+                "workspace_root",
+            ),
+            (
+                {
+                    "input": "hello",
+                    "workspace_root": str(Path.cwd()),
+                    "mode": "edit",
+                },
+                "mode",
+            ),
+            (
+                {
+                    "input": "hello",
+                    "workspace_root": str(Path.cwd()),
+                    "mode": "ask",
+                    "include_reasoning": "true",
+                },
+                "include_reasoning",
+            ),
+        ],
+    )
+    async def test_start_validates_workmate_run_fields(
+        self, adapter, body, error_field
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs", json=body)
+            payload = await response.json()
+
+        assert response.status == 400
+        assert error_field in payload["error"]["message"]
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -134,7 +190,7 @@ class TestStartRun:
                 mock_agent.session_total_tokens = 15
                 mock_create.return_value = mock_agent
 
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                resp = await cli.post("/v1/runs", json=_run_body())
                 assert resp.status == 202
                 data = await resp.json()
                 assert data["status"] == "started"
@@ -175,7 +231,7 @@ class TestStartRun:
 
                 resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "hello", "session_id": "runs-raw-sid"},
+                    json=_run_body(session_id="runs-raw-sid"),
                 )
                 assert resp.status == 202
                 data = await resp.json()
@@ -213,11 +269,7 @@ class TestStartRun:
             with patch.object(adapter, "_create_agent") as mock_create:
                 resp = await cli.post(
                     "/v1/runs",
-                    json={
-                        "input": "hello",
-                        "model": "alias",
-                        "provider": "minimax",
-                    },
+                    json=_run_body(model="alias", provider="minimax"),
                 )
                 data = await resp.json()
 
@@ -242,12 +294,11 @@ class TestStartRun:
 
                 resp = await cli.post(
                     "/v1/runs",
-                    json={
-                        "input": "hello",
-                        "model": "MiniMax-M3",
-                        "provider": "minimax",
-                        "model_options": model_options,
-                    },
+                    json=_run_body(
+                        model="MiniMax-M3",
+                        provider="minimax",
+                        model_options=model_options,
+                    ),
                 )
                 assert resp.status == 202
                 for _ in range(20):
@@ -282,7 +333,7 @@ class TestRunStatus:
 
                 resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "hello", "session_id": "space-session"},
+                    json=_run_body(session_id="space-session"),
                 )
                 data = await resp.json()
                 run_id = data["run_id"]
@@ -295,7 +346,7 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
+                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == run_id
                 assert status["session_id"] == "space-session"
 
 
@@ -305,6 +356,215 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_shared_session_runs_isolate_workspace_mode_and_cleanup(
+        self, adapter, tmp_path
+    ):
+        workspaces = [tmp_path / "one", tmp_path / "two"]
+        for workspace in workspaces:
+            workspace.mkdir()
+        barrier = threading.Barrier(2)
+        captured: list[tuple[str, str, str, str]] = []
+
+        def _create_agent(**_kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**run_kwargs):
+                from agent.runtime_cwd import resolve_agent_cwd
+                from tools.terminal_tool import resolve_task_overrides
+
+                task_id = run_kwargs["task_id"]
+                overrides = resolve_task_overrides(task_id)
+                captured.append(
+                    (
+                        task_id,
+                        overrides["cwd"],
+                        overrides["wm_mode"],
+                        str(resolve_agent_cwd()),
+                    )
+                )
+                barrier.wait(timeout=5)
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                responses = [
+                    await cli.post(
+                        "/v1/runs",
+                        json=_run_body(
+                            workspace_root=str(workspaces[index]),
+                            mode=mode,
+                            session_id="shared-session",
+                        ),
+                    )
+                    for index, mode in enumerate(("ask", "craft"))
+                ]
+                run_ids = [(await response.json())["run_id"] for response in responses]
+                for run_id in run_ids:
+                    await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert {item[0] for item in captured} == set(run_ids)
+        assert {(item[1], item[2], item[3]) for item in captured} == {
+            (str(workspaces[0].resolve()), "ask", str(workspaces[0].resolve())),
+            (str(workspaces[1].resolve()), "craft", str(workspaces[1].resolve())),
+        }
+        from tools.terminal_tool import resolve_task_overrides
+
+        assert all(resolve_task_overrides(run_id) == {} for run_id in run_ids)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_message_events_are_ordered_redacted_and_sequenced(
+        self, adapter
+    ):
+        def _create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["reasoning_callback"](
+                    "Inspect OPENAI_API_KEY=sk-live-secret-1234567890"
+                )
+                kwargs["tool_progress_callback"]("tool.started", "web_search")
+                kwargs["reasoning_callback"]("Synthesize")
+                kwargs["stream_delta_callback"]("first")
+                kwargs["stream_delta_callback"]("second")
+                return {"final_response": "firstsecond"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post(
+                    "/v1/runs",
+                    json=_run_body(include_reasoning=True),
+                )
+                run_id = (await response.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert "sk-live-secret-1234567890" not in body
+        assert [event["event"] for event in events] == [
+            "reasoning.started",
+            "reasoning.completed",
+            "tool.started",
+            "reasoning.started",
+            "reasoning.completed",
+            "message.delta",
+            "message.delta",
+            "run.completed",
+        ]
+        deltas = [event for event in events if event["event"] == "message.delta"]
+        assert [event["seq"] for event in deltas] == [1, 2]
+        segments = [
+            event for event in events if event["event"] == "reasoning.completed"
+        ]
+        assert [event["segment_seq"] for event in segments] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_segment_is_truncated_and_disabled_by_default(
+        self, adapter
+    ):
+        captured = {}
+
+        def _create_agent(**kwargs):
+            captured.update(kwargs)
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                if "reasoning_callback" in kwargs:
+                    kwargs["reasoning_callback"](
+                        "x" * MAX_RUN_REASONING_SEGMENT_CHARS
+                    )
+                    kwargs["reasoning_callback"]("overflow")
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post(
+                    "/v1/runs", json=_run_body(include_reasoning=True)
+                )
+                run_id = (await response.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+        assert '"truncated": true' in body
+
+        captured.clear()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post("/v1/runs", json=_run_body())
+                run_id = (await response.json())["run_id"]
+                await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+        assert "reasoning_callback" not in captured
+
+    @pytest.mark.asyncio
+    async def test_file_paths_are_deduplicated_workspace_relative_and_bounded(
+        self, adapter, tmp_path
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        inside = workspace / "src" / "app.py"
+        outside = tmp_path / "secret.txt"
+
+        def _create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["tool_progress_callback"](
+                    "tool.completed",
+                    "write_file",
+                    duration=0.1,
+                    is_error=False,
+                    file_paths=[str(inside), str(outside), str(inside)],
+                )
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post(
+                    "/v1/runs",
+                    json=_run_body(workspace_root=str(workspace)),
+                )
+                run_id = (await response.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed = next(event for event in events if event["event"] == "tool.completed")
+        assert completed["file_paths"] == ["src/app.py"]
+        assert str(workspace) not in body
+        assert str(outside) not in body
     @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""
@@ -319,7 +579,7 @@ class TestRunEvents:
                 mock_create.return_value = mock_agent
 
                 # Start run
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                resp = await cli.post("/v1/runs", json=_run_body())
                 assert resp.status == 202
                 data = await resp.json()
                 run_id = data["run_id"]
@@ -346,12 +606,12 @@ class TestRunEvents:
 
                 victim_resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "victim", "session_id": "shared-project"},
+                    json=_run_body(input="victim", session_id="shared-project"),
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 attacker_resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "attacker", "session_id": "shared-project"},
+                    json=_run_body(input="attacker", session_id="shared-project"),
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert victim_resp.status == 202
@@ -381,14 +641,14 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={"choice": "session", "resolve_all": True},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
                 assert approval_data["resolved"] == 1
-                assert attacker_entry.result == "always"
+                assert attacker_entry.result == "session"
                 assert attacker_entry.event.is_set()
                 assert victim_entry.result is None
                 assert not victim_entry.event.is_set()
@@ -503,7 +763,7 @@ class TestSteerRun:
                 mock_agent.run_conversation.side_effect = _run_conversation
                 mock_create.return_value = mock_agent
 
-                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                start_resp = await cli.post("/v1/runs", json=_run_body())
                 run_id = (await start_resp.json())["run_id"]
                 assert run_started.wait(timeout=3.0)
 
@@ -545,7 +805,7 @@ class TestSteerRun:
                 }
                 mock_create.return_value = mock_agent
 
-                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                start_resp = await cli.post("/v1/runs", json=_run_body())
                 run_id = (await start_resp.json())["run_id"]
 
                 for _ in range(40):
@@ -584,7 +844,7 @@ class TestRunLifecycleSweep:
                 mock_agent, agent_ready, _ = _make_slow_agent()
                 mock_create.return_value = mock_agent
 
-                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                start_resp = await cli.post("/v1/runs", json=_run_body())
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
                 assert agent_ready.wait(timeout=3.0)
@@ -622,11 +882,11 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"choice": "session"},
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()
-                assert pending.result == "once"
+                assert pending.result == "session"
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
@@ -664,7 +924,7 @@ class TestStopRun:
                 mock_agent.run_conversation.side_effect = _run_conversation
                 mock_create.return_value = mock_agent
 
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                resp = await cli.post("/v1/runs", json=_run_body())
                 run_id = (await resp.json())["run_id"]
                 assert started.wait(timeout=3)
 
@@ -697,7 +957,7 @@ class TestStopRun:
                 mock_create.return_value = mock_agent
 
                 # Start run
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                resp = await cli.post("/v1/runs", json=_run_body())
                 assert resp.status == 202
                 data = await resp.json()
                 run_id = data["run_id"]
@@ -740,7 +1000,7 @@ class TestStopRun:
                 mock_create.return_value = mock_agent
 
                 # Start run
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                resp = await cli.post("/v1/runs", json=_run_body())
                 assert resp.status == 202
                 data = await resp.json()
                 run_id = data["run_id"]
@@ -785,7 +1045,7 @@ class TestRunsProviderAuthFailure:
                     "No credentials found for provider 'nous'"
                 )
 
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                resp = await cli.post("/v1/runs", json=_run_body())
                 assert resp.status == 202
                 data = await resp.json()
                 run_id = data["run_id"]

@@ -1909,10 +1909,23 @@ def dump_api_request_debug(
                 "type": type(error).__name__,
                 "message": str(error),
             }
+            try:
+                from agent.process_bootstrap import request_id_from_error
+
+                local_request_id = request_id_from_error(error)
+            except Exception:
+                local_request_id = None
+            if local_request_id is not None:
+                header, value = local_request_id
+                dump_payload["request"]["headers"][header] = value
+                error_info["request_id"] = value
             for attr_name in ("status_code", "request_id", "code", "param", "type"):
                 attr_value = getattr(error, attr_name, None)
                 if attr_value is not None:
-                    error_info[attr_name] = attr_value
+                    if attr_name == "request_id" and local_request_id is not None:
+                        error_info["provider_request_id"] = attr_value
+                    else:
+                        error_info[attr_name] = attr_value
 
             body_attr = getattr(error, "body", None)
             if body_attr is not None:

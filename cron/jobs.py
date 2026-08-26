@@ -2311,6 +2311,84 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def skip_missed_jobs(after: str) -> Dict[str, int]:
+    """Advance work missed while WorkMate deliberately stopped the scheduler."""
+    try:
+        stopped_at = _ensure_aware(
+            datetime.fromisoformat(str(after).replace("Z", "+00:00"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("after must be an ISO 8601 timestamp") from exc
+
+    now = _hermes_now()
+    if stopped_at > now:
+        raise ValueError("after must not be in the future")
+    reason = (
+        "Skipped because the WorkMate scheduler was stopped from "
+        f"{stopped_at.isoformat()} until {now.isoformat()}."
+    )
+    recurring = 0
+    oneshot = 0
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                continue
+            schedule = job.get("schedule")
+            if not isinstance(schedule, dict):
+                continue
+            kind = schedule.get("kind")
+            if kind not in {"cron", "interval", "once"}:
+                continue
+            next_run_at = job.get("next_run_at")
+            if not isinstance(next_run_at, str):
+                continue
+            try:
+                due_at = _ensure_aware(
+                    datetime.fromisoformat(next_run_at.replace("Z", "+00:00"))
+                )
+            except ValueError:
+                continue
+            if due_at > now:
+                continue
+
+            if kind in {"cron", "interval"}:
+                next_future = compute_next_run(schedule, now.isoformat())
+                if next_future is None:
+                    continue
+                job.update({
+                    "next_run_at": next_future,
+                    "last_skipped_at": now.isoformat(),
+                    "last_skipped_reason": reason,
+                    "state": "scheduled",
+                })
+                recurring += 1
+            else:
+                job.update({
+                    "enabled": False,
+                    "state": "missed",
+                    "next_run_at": None,
+                    "missed_at": now.isoformat(),
+                    "missed_reason": reason,
+                })
+                oneshot += 1
+
+            from cron.executions import record_skipped_execution
+
+            record_skipped_execution(
+                job["id"],
+                reason=reason,
+                idempotency_key=next_run_at,
+            )
+
+        total = recurring + oneshot
+        if total:
+            save_jobs(jobs)
+
+    return {"recurring": recurring, "oneshot": oneshot, "total": total}
+
+
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
