@@ -70,8 +70,9 @@ class TestApiServerAdapterToolset:
             # No platform_toolsets override — should fall back to hermes-api-server default
             mock_config.return_value = {}
             mock_agent_cls.return_value = MagicMock()
+            reasoning_callback = MagicMock()
 
-            adapter._create_agent()
+            adapter._create_agent(reasoning_callback=reasoning_callback)
 
             mock_agent_cls.assert_called_once()
             call_kwargs = mock_agent_cls.call_args
@@ -79,4 +80,4 @@ class TestApiServerAdapterToolset:
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
-
+            assert call_kwargs.kwargs.get("reasoning_callback") is reasoning_callback
