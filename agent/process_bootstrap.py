@@ -175,10 +175,8 @@ def build_keepalive_http_client(
     client uses. It is passed on the client AND on the plain no-proxy mounts
     (a mounted transport owns the SSL context for its scheme).
 
-    ``request_id_header`` opts a client into a fresh UUID4 request ID for
-    every outbound HTTP attempt. The header name is configuration; its value
-    is deliberately created in an httpx request hook, never in static client
-    headers, so retries cannot reuse a billing or tracing ID.
+    ``request_id_header`` enables a fresh UUID4 on every actual HTTP attempt.
+    A request hook owns generation so transport retries cannot reuse an ID.
     """
     try:
         import httpx
@@ -201,7 +199,10 @@ def build_keepalive_http_client(
                 "http://": transport_cls(verify=verify),
                 "https://": transport_cls(verify=verify),
             }
-        event_hooks = _request_id_event_hooks(request_id_header)
+        event_hooks = _request_id_event_hooks(
+            request_id_header,
+            async_mode=async_mode,
+        )
         return client_cls(
             limits=limits,
             timeout=timeout,
@@ -215,47 +216,53 @@ def build_keepalive_http_client(
 
 
 def normalize_request_id_header(value: Any) -> str | None:
-    """Return a valid HTTP field name or ``None`` for an unset/invalid value."""
+    """Return a valid HTTP field name, or ``None`` when disabled/invalid."""
     if not isinstance(value, str):
         return None
     header = value.strip()
     return header if _HTTP_FIELD_NAME_RE.fullmatch(header) else None
 
 
-def _request_id_event_hooks(request_id_header: str | None) -> dict[str, list] | None:
+def _inject_request_id(request: Any, header: str) -> None:
+    request_id = str(uuid.uuid4())
+    request.headers[header] = request_id
+    request.extensions["hermes.request_id_header"] = header
+    request.extensions["hermes.request_id"] = request_id
+
+
+def _request_id_event_hooks(
+    request_id_header: str | None,
+    *,
+    async_mode: bool = False,
+) -> dict[str, list] | None:
+    """Build sync/async httpx hooks for per-attempt request correlation."""
     header = normalize_request_id_header(request_id_header)
     if header is None:
         return None
+    if async_mode:
+        async def inject_async(request: Any) -> None:
+            _inject_request_id(request, header)
 
-    def inject_request_id(request: Any) -> None:
-        request_id = str(uuid.uuid4())
-        request.headers[header] = request_id
-        # Preserve only the ID we generated. Error handlers receive the
-        # originating ``httpx.Request`` through ``response.request`` and can
-        # therefore persist/display the exact failed attempt without trusting
-        # response-controlled headers.
-        request.extensions["hermes.request_id_header"] = header
-        request.extensions["hermes.request_id"] = request_id
+        return {"request": [inject_async]}
 
-    return {"request": [inject_request_id]}
+    def inject_sync(request: Any) -> None:
+        _inject_request_id(request, header)
+
+    return {"request": [inject_sync]}
 
 
 def request_id_from_error(error: BaseException) -> tuple[str, str] | None:
-    """Return the request ID injected by this process for an HTTP error.
-
-    Only values stored by ``_request_id_event_hooks`` are accepted. This keeps
-    the error surface independent from arbitrary provider response headers.
-    """
+    """Read only the request ID generated locally for the failed attempt."""
     response = getattr(error, "response", None)
-    request = getattr(response, "request", None)
+    request = getattr(response, "request", None) if response is not None else None
+    if request is None:
+        request = getattr(error, "request", None)
     extensions = getattr(request, "extensions", None)
     if not isinstance(extensions, dict):
         return None
     header = extensions.get("hermes.request_id_header")
     request_id = extensions.get("hermes.request_id")
-    if not isinstance(header, str) or not isinstance(request_id, str):
-        return None
-    if normalize_request_id_header(header) is None or not request_id:
+    if normalize_request_id_header(header) is None or not isinstance(request_id, str):
         return None
     return header, request_id
 

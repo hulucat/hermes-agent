@@ -1,125 +1,148 @@
-"""PATCH-004: per-run ``model.used`` SSE attribution (api_server side).
+"""Run-scoped resolved-model SSE, persistence and query contracts."""
 
-These tests pin the core correctness guarantee of PATCH-004: two ``/v1/runs``
-sharing one ``session_id`` each receive their OWN ``model.used`` SSE events
-with independent ``seq`` counters and no cross-talk, even though the
-``post_api_request`` hook fires from the shared agent executor pool.
-
-Coverage here is deliberately split from the state.db layer
-(``tests/test_hermes_state_run_model_usage.py``) and from end-to-end:
-
-* Hook dispatch / per-run seq / no-cross-talk — here (unit, no live agent).
-* record/get + FK CASCADE — ``test_hermes_state_run_model_usage.py``.
-* End-to-end concurrent ``POST /v1/runs`` with a real agent — deferred to the
-  TaskFacade stage, where a real agent-creation path exists; the fragile
-  ``_handle_runs`` internal mocking it would require today adds no signal
-  beyond what these two layers already prove.
-"""
 import asyncio
 import threading
-from unittest.mock import patch
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from hermes_cli.plugins import get_plugin_manager, invoke_hook
 
 
-def _register_isolated(adapter: APIServerAdapter, loop) -> list:
-    """Register the PATCH-004 sink against an isolated global hook list.
+class _UsageDB:
+    def __init__(self):
+        self.rows = []
 
-    Returns the previously-registered callbacks so the caller can restore
-    them in a finally block — the plugin manager is a process-wide singleton.
-    """
-    mgr = get_plugin_manager()
-    saved = mgr._hooks.get("post_api_request", [])
-    mgr._hooks["post_api_request"] = []
-    adapter._register_model_usage_hook(loop)
-    return saved
+    def record_run_model_usage(
+        self, run_id, session_id, seq, resolved_model, *, reason, timestamp
+    ):
+        self.rows.append({
+            "run_id": run_id,
+            "session_id": session_id,
+            "seq": seq,
+            "resolved_model": resolved_model,
+            "reason": reason,
+            "timestamp": timestamp,
+        })
+
+    def get_run_model_usage(self, run_id):
+        return sorted(
+            (row for row in self.rows if row["run_id"] == run_id),
+            key=lambda row: row["seq"],
+        )
 
 
-@pytest.mark.asyncio
-async def test_model_used_dispatches_per_run_id_without_crosstalk():
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    loop = asyncio.get_running_loop()
-    saved = _register_isolated(adapter, loop)
-    try:
-        q_a: asyncio.Queue = asyncio.Queue()
-        q_b: asyncio.Queue = asyncio.Queue()
-        adapter._run_streams["run_a"] = q_a
-        adapter._run_streams["run_b"] = q_b
-
-        def fire(run_id: str, model: str) -> None:
-            # The hook fires on the agent executor thread; mirror that here.
-            invoke_hook(
-                "post_api_request",
-                run_id=run_id,
-                session_id="shared-session",
-                response_model=model,
-            )
-
-        # Persistence is covered by the state.db test; keep it a no-op here so
-        # the assertion targets dispatch only and never touches hermes home.
-        with patch.object(adapter, "_persist_model_usage", lambda *a, **k: None):
-            t_a = threading.Thread(target=fire, args=("run_a", "claude-A"))
-            t_b = threading.Thread(target=fire, args=("run_b", "claude-B"))
-            t_a.start()
-            t_b.start()
-            t_a.join()
-            t_b.join()
-            # call_soon_threadsafe scheduled _on_model_used; let the loop run it.
-            await asyncio.sleep(0.08)
-
-            async def collect(q: asyncio.Queue) -> list:
-                out = []
-                for _ in range(8):
-                    try:
-                        ev = await asyncio.wait_for(q.get(), timeout=0.3)
-                    except asyncio.TimeoutError:
-                        break
-                    if ev and ev.get("event") == "model.used":
-                        out.append(ev)
-                return out
-
-            a_events = await collect(q_a)
-            b_events = await collect(q_b)
-
-        assert len(a_events) == 1
-        assert a_events[0]["run_id"] == "run_a"
-        assert a_events[0]["model"] == "claude-A"
-        assert a_events[0]["seq"] == 1  # independent per-run counter
-
-        assert len(b_events) == 1
-        assert b_events[0]["run_id"] == "run_b"
-        assert b_events[0]["model"] == "claude-B"
-        assert b_events[0]["seq"] == 1  # NOT 2 — no carry-over from run_a
-    finally:
-        get_plugin_manager()._hooks["post_api_request"] = saved
+def _bind_run(adapter, run_id, session_id, db, loop):
+    adapter._run_streams[run_id] = asyncio.Queue()
+    adapter._run_model_contexts[run_id] = {
+        "loop": loop,
+        "session_id": session_id,
+        "db": db,
+        "seq": 0,
+        "persist_tasks": set(),
+    }
 
 
 @pytest.mark.asyncio
-async def test_model_used_skipped_when_no_run_id():
-    """Agents outside /v1/runs (chat/completions, CLI, gateway) never get
-    ``run_id`` tagged on their instance (PATCH-004 1A only tags /v1/runs
-    agents), so the sink MUST skip them — otherwise every chat turn would
-    emit a spurious ``model.used`` and try to persist with run_id=None."""
+async def test_model_used_isolated_for_concurrent_runs_sharing_session():
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     loop = asyncio.get_running_loop()
-    saved = _register_isolated(adapter, loop)
-    try:
-        q: asyncio.Queue = asyncio.Queue()
-        adapter._run_streams["run_x"] = q  # would receive a leak if any
+    db = _UsageDB()
+    _bind_run(adapter, "run_a", "shared-session", db, loop)
+    _bind_run(adapter, "run_b", "shared-session", db, loop)
 
-        with patch.object(adapter, "_persist_model_usage", lambda *a, **k: None):
-            invoke_hook(
-                "post_api_request",
-                run_id=None,  # no /v1/runs correlation
-                session_id="s",
-                response_model="claude-X",
-            )
-            await asyncio.sleep(0.08)
+    threads = [
+        threading.Thread(
+            target=adapter._dispatch_model_usage_hook,
+            kwargs={
+                "run_id": run_id,
+                "session_id": "shared-session",
+                "response_model": model,
+            },
+        )
+        for run_id, model in (("run_a", "model-a"), ("run_b", "model-b"))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
 
-        assert q.empty(), "model.used leaked for a run_id-less agent"
-    finally:
-        get_plugin_manager()._hooks["post_api_request"] = saved
+    await asyncio.sleep(0)
+    await adapter._drain_run_model_usage("run_a")
+    await adapter._drain_run_model_usage("run_b")
+
+    event_a = await adapter._run_streams["run_a"].get()
+    event_b = await adapter._run_streams["run_b"].get()
+    assert (event_a["run_id"], event_a["seq"], event_a["model"]) == (
+        "run_a", 1, "model-a"
+    )
+    assert (event_b["run_id"], event_b["seq"], event_b["model"]) == (
+        "run_b", 1, "model-b"
+    )
+    assert [(row["run_id"], row["seq"]) for row in db.rows] == [
+        ("run_a", 1),
+        ("run_b", 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_used_ignores_calls_without_active_run_context():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._dispatch_model_usage_hook(
+        run_id=None,
+        session_id="session-x",
+        response_model="model-x",
+    )
+    adapter._dispatch_model_usage_hook(
+        run_id="unknown-run",
+        session_id="session-x",
+        response_model="model-x",
+    )
+    await asyncio.sleep(0)
+    assert adapter._run_model_contexts == {}
+
+
+@pytest.mark.asyncio
+async def test_model_usage_query_requires_auth_and_returns_persisted_rows():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "sk-secret"})
+    )
+    db = _UsageDB()
+    db.rows.extend([
+        {
+            "run_id": "run_x",
+            "session_id": "session-x",
+            "seq": 2,
+            "resolved_model": "model-b",
+            "reason": "api",
+            "timestamp": "2.0",
+        },
+        {
+            "run_id": "run_x",
+            "session_id": "session-x",
+            "seq": 1,
+            "resolved_model": "model-a",
+            "reason": "api",
+            "timestamp": "1.0",
+        },
+    ])
+    adapter._session_db = db
+    app = web.Application()
+    app.router.add_get(
+        "/v1/runs/{run_id}/model-usage", adapter._handle_run_model_usage
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        unauthorized = await client.get("/v1/runs/run_x/model-usage")
+        assert unauthorized.status == 401
+        response = await client.get(
+            "/v1/runs/run_x/model-usage",
+            headers={"Authorization": "Bearer sk-secret"},
+        )
+        assert response.status == 200
+        rows = await response.json()
+
+    assert [row["seq"] for row in rows] == [1, 2]
+    assert [row["resolved_model"] for row in rows] == ["model-a", "model-b"]

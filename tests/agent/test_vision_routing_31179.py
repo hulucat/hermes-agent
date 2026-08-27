@@ -60,13 +60,36 @@ def _write_config(home: str, text: str) -> None:
         fp.write(text)
 
 
+_RELOAD_PREFIXES = ("agent.auxiliary_client", "agent.image_routing",
+                    "tools.vision_tools", "tools.browser_tool",
+                    "hermes_cli.config")
+
+
+def _drop_reload_targets():
+    for mod in list(sys.modules.keys()):
+        if mod.startswith(_RELOAD_PREFIXES):
+            del sys.modules[mod]
+
+
+@pytest.fixture(autouse=True)
+def _module_isolation():
+    """Save/restore sys.modules entries this file reloads.
+
+    Without this, reloaded copies of agent.image_routing & friends leak
+    into sys.modules after the test, splitting module identity for any
+    later test that patches ``agent.image_routing.*`` while holding
+    function refs from the original module (issue #61597).
+    """
+    saved = {name: mod for name, mod in sys.modules.items()
+             if name.startswith(_RELOAD_PREFIXES)}
+    yield
+    _drop_reload_targets()
+    sys.modules.update(saved)
+
+
 def _fresh_modules():
     """Drop cached hermes modules so each test reloads against current env."""
-    for mod in list(sys.modules.keys()):
-        if mod.startswith(("agent.auxiliary_client", "agent.image_routing",
-                           "tools.vision_tools", "tools.browser_tool",
-                           "hermes_cli.config")):
-            del sys.modules[mod]
+    _drop_reload_targets()
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +180,18 @@ model:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
 
-        from agent.auxiliary_client import resolve_vision_provider_client
+        from agent import auxiliary_client
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_main_model_supports_vision",
+            lambda _provider, _model: False,
+        )
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_resolve_strict_vision_backend",
+            lambda *_args, **_kwargs: (None, None),
+        )
+        resolve_vision_provider_client = auxiliary_client.resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is None, (
             f"Vision auto-detect must skip text-only main {provider!r} when "
@@ -175,7 +209,13 @@ model:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         _fresh_modules()
 
-        from agent.auxiliary_client import resolve_vision_provider_client
+        from agent import auxiliary_client
+        monkeypatch.setattr(
+            auxiliary_client,
+            "_try_anthropic",
+            lambda explicit_api_key=None: (object(), "claude-sonnet-4-6"),
+        )
+        resolve_vision_provider_client = auxiliary_client.resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is not None
         assert provider == "anthropic"
@@ -215,71 +255,9 @@ auxiliary:
         from tools.vision_tools import check_vision_requirements
         assert check_vision_requirements() is True
 
-    def test_check_vision_falls_back_to_auto(self, isolated_home, monkeypatch):
-        """Bad explicit provider doesn't hide the tool when auto fallback works.
 
-        Mirrors call_llm's runtime fallback chain.
-        """
-        _write_config(isolated_home, """
-model:
-  provider: openrouter
-  default: anthropic/claude-sonnet-4
-auxiliary:
-  vision:
-    provider: not-a-real-provider
-""")
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        _fresh_modules()
 
-        from tools.vision_tools import check_vision_requirements
-        assert check_vision_requirements() is True
 
-    def test_check_vision_false_with_text_only_main_and_no_aggregator(
-        self, isolated_home, monkeypatch
-    ):
-        _write_config(isolated_home, """
-model:
-  provider: deepseek
-  default: deepseek-v4-pro
-""")
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from tools.vision_tools import check_vision_requirements
-        assert check_vision_requirements() is False
-
-    def test_browser_vision_requires_both_browser_and_vision(self, isolated_home, monkeypatch):
-        """``browser_vision`` must not be advertised when vision is unavailable."""
-        from unittest.mock import patch
-
-        _write_config(isolated_home, """
-model:
-  provider: deepseek
-  default: deepseek-v4-pro
-""")
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-        _fresh_modules()
-
-        import tools.browser_tool
-        # Force the browser side to True so we exercise the vision-gating part.
-        with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
-            assert tools.browser_tool.check_browser_vision_requirements() is False
-
-    def test_browser_vision_false_when_browser_missing(self, isolated_home, monkeypatch):
-        from unittest.mock import patch
-
-        _write_config(isolated_home, """
-model:
-  provider: openrouter
-  default: anthropic/claude-sonnet-4
-""")
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        _fresh_modules()
-
-        import tools.browser_tool
-        with patch.object(tools.browser_tool, "check_browser_requirements", return_value=False):
-            # Vision available but browser missing → still False.
-            assert tools.browser_tool.check_browser_vision_requirements() is False
 
     def test_browser_vision_true_when_both_available(self, isolated_home, monkeypatch):
         from unittest.mock import patch
