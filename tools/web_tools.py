@@ -101,6 +101,7 @@ from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensi
 import sys
 
 logger = logging.getLogger(__name__)
+_WM_REQUEST_ID_FIELD = "x_wm_request_id"
 
 
 def _web_extract_url(value: Any) -> Optional[str]:
@@ -564,6 +565,16 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     rescued_errors = [r.get("error", "") for r in rescued]
     if rescued and all(e for e in rescued_errors):
         return results  # rescue also failed everywhere: keep original errors
+    request_ids = {
+        result.get(_WM_REQUEST_ID_FIELD)
+        for result in results
+        if isinstance(result.get(_WM_REQUEST_ID_FIELD), str)
+    }
+    request_id = next(iter(request_ids)) if len(request_ids) == 1 else None
+    if request_id:
+        for result in rescued:
+            if result.get("error"):
+                result[_WM_REQUEST_ID_FIELD] = request_id
     for r in rescued:
         if not r.get("error"):
             meta = r.setdefault("metadata", {})
@@ -981,12 +992,18 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 ):
                     # One-shot keyless rescue: THIS call rides the free-tier
                     # ring; the next call attempts the chosen backend again.
+                    original_request_id = response_data.get(_WM_REQUEST_ID_FIELD)
                     response_data = _rescue_search(
                         provider.name,
                         str(response_data.get("error", "")),
                         query,
                         limit,
                     )
+                    if (
+                        not response_data.get("success")
+                        and isinstance(original_request_id, str)
+                    ):
+                        response_data[_WM_REQUEST_ID_FIELD] = original_request_id
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -1330,6 +1347,12 @@ async def web_extract_tool(
                 "content": r.get("content", ""),
                 "error": r.get("error"),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
+                **(
+                    {_WM_REQUEST_ID_FIELD: r[_WM_REQUEST_ID_FIELD]}
+                    if r.get("error")
+                    and isinstance(r.get(_WM_REQUEST_ID_FIELD), str)
+                    else {}
+                ),
             }
             for r in response.get("results", [])
         ]

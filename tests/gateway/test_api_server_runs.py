@@ -25,6 +25,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     MAX_RUN_REASONING_SEGMENT_CHARS,
     _approval_event_choices,
+    _extract_x_wm_request_id,
     cors_middleware,
     security_headers_middleware,
 )
@@ -52,6 +53,50 @@ def test_approval_event_choices_follow_backend_capabilities(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
     ) == expected
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            {
+                "success": False,
+                "error": "failed",
+                "x_wm_request_id": "11111111-1111-4111-8111-111111111111",
+            },
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (
+            {
+                "results": [
+                    {
+                        "error": "failed",
+                        "x_wm_request_id": "22222222-2222-4222-8222-222222222222",
+                    }
+                ]
+            },
+            "22222222-2222-4222-8222-222222222222",
+        ),
+        ({"x_wm_request_id": "not-a-uuid"}, None),
+        (
+            {
+                "results": [
+                    {
+                        "error": "first",
+                        "x_wm_request_id": "33333333-3333-4333-8333-333333333333",
+                    },
+                    {
+                        "error": "second",
+                        "x_wm_request_id": "44444444-4444-4444-8444-444444444444",
+                    },
+                ]
+            },
+            None,
+        ),
+    ],
+)
+def test_extract_x_wm_request_id_accepts_one_canonical_uuid4(result, expected):
+    assert _extract_x_wm_request_id(json.dumps(result)) == expected
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -565,6 +610,55 @@ class TestRunEvents:
         assert completed["file_paths"] == ["src/app.py"]
         assert str(workspace) not in body
         assert str(outside) not in body
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_event_exposes_only_valid_x_wm_request_id(
+        self, adapter
+    ):
+        request_id = "55555555-5555-4555-8555-555555555555"
+
+        def _create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["tool_progress_callback"](
+                    "tool.completed",
+                    "web_search",
+                    duration=0.1,
+                    is_error=True,
+                    result=json.dumps(
+                        {
+                            "success": False,
+                            "error": "cloud rejected",
+                            "x_wm_request_id": request_id,
+                            "secret": "must-not-leak",
+                        }
+                    ),
+                )
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post("/v1/runs", json=_run_body())
+                run_id = (await response.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed = next(event for event in events if event["event"] == "tool.completed")
+        assert completed["x_wm_request_id"] == request_id
+        assert "must-not-leak" not in body
+
     @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""
