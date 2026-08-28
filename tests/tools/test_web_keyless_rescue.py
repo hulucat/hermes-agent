@@ -53,6 +53,29 @@ class _RaisingProvider(_KeyedBoomProvider):
         raise RuntimeError("connection reset by peer")
 
 
+class _TrackedBoomProvider(_KeyedBoomProvider):
+    request_id = "11111111-1111-4111-8111-111111111111"
+
+    def search(self, query, limit=5):
+        return {
+            "success": False,
+            "error": "HTTP 500 upstream exploded",
+            "x_wm_request_id": self.request_id,
+        }
+
+    def extract(self, urls, **kwargs):
+        return [
+            {
+                "url": url,
+                "title": "",
+                "content": "",
+                "error": "HTTP 500 upstream exploded",
+                "x_wm_request_id": self.request_id,
+            }
+            for url in urls
+        ]
+
+
 @pytest.fixture(autouse=True)
 def _keyed_tavily_env(monkeypatch):
     """Simulate a keyed Tavily setup with rescue enabled."""
@@ -121,6 +144,14 @@ class TestSearchRescue:
         assert "next call" in out["data"]["backend_error"].lower()
         ring.assert_called_once()
 
+    def test_successful_rescue_drops_original_request_id(self, monkeypatch):
+        with patch.object(
+            keyless_mcp, "search_with_failover", return_value=_ring_ok()
+        ):
+            out = self._dispatch(monkeypatch, _TrackedBoomProvider())
+        assert out["success"] is True
+        assert "x_wm_request_id" not in out
+
     def test_raised_exception_rescued(self, monkeypatch):
         with patch.object(
             keyless_mcp, "search_with_failover", return_value=_ring_ok()
@@ -157,6 +188,14 @@ class TestSearchRescue:
         assert out["success"] is False
         assert "HTTP 500 upstream exploded" in out["error"]
         assert "keyless rescue also failed" in out["error"]
+
+    def test_rescue_failure_keeps_original_request_id(self, monkeypatch):
+        with patch.object(
+            keyless_mcp, "search_with_failover",
+            return_value={"success": False, "error": "all throttled"},
+        ):
+            out = self._dispatch(monkeypatch, _TrackedBoomProvider())
+        assert out["x_wm_request_id"] == _TrackedBoomProvider.request_id
 
     def test_no_rescue_when_disabled(self, monkeypatch):
         monkeypatch.setattr(
@@ -202,6 +241,25 @@ class TestExtractRescue:
         assert results[0]["content"].startswith("x")
         ring.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_successful_extract_rescue_drops_original_request_id(
+        self, monkeypatch
+    ):
+        good = [
+            {
+                "url": "https://a",
+                "title": "A",
+                "content": "x" * 50,
+                "raw_content": "x" * 50,
+                "metadata": {},
+            }
+        ]
+        with patch.object(keyless_mcp, "extract_with_failover", return_value=good):
+            results = await self._dispatch(
+                monkeypatch, _TrackedBoomProvider(), ["https://a"]
+            )
+        assert "x_wm_request_id" not in results[0]
+
     def test_rescue_extract_annotates_results(self, monkeypatch):
         good = [
             {"url": "https://a", "title": "A", "content": "x",
@@ -245,3 +303,18 @@ class TestExtractRescue:
                 monkeypatch, _KeyedBoomProvider(), ["https://a", "https://b"]
             )
         assert all("HTTP 500" in r.get("error", "") for r in results)
+
+    @pytest.mark.asyncio
+    async def test_extract_rescue_failure_keeps_original_request_id(
+        self, monkeypatch
+    ):
+        still_bad = [
+            {"url": "https://a", "title": "", "content": "", "error": "ring dead"}
+        ]
+        with patch.object(
+            keyless_mcp, "extract_with_failover", return_value=still_bad
+        ):
+            results = await self._dispatch(
+                monkeypatch, _TrackedBoomProvider(), ["https://a"]
+            )
+        assert results[0]["x_wm_request_id"] == _TrackedBoomProvider.request_id

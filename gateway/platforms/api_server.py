@@ -71,6 +71,44 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+_WM_REQUEST_ID_FIELD = "x_wm_request_id"
+
+
+def _extract_x_wm_request_id(raw_result: object) -> Optional[str]:
+    """Extract one canonical UUID4 from a failed managed web-tool result."""
+    if isinstance(raw_result, str):
+        try:
+            payload = json.loads(raw_result)
+        except (TypeError, ValueError):
+            return None
+    elif isinstance(raw_result, dict):
+        payload = raw_result
+    else:
+        return None
+
+    candidates: set[str] = set()
+    direct = payload.get(_WM_REQUEST_ID_FIELD)
+    if isinstance(direct, str):
+        candidates.add(direct)
+    results = payload.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, dict) or not result.get("error"):
+                continue
+            value = result.get(_WM_REQUEST_ID_FIELD)
+            if isinstance(value, str):
+                candidates.add(value)
+    if len(candidates) != 1:
+        return None
+    candidate = next(iter(candidates))
+    try:
+        parsed = uuid.UUID(candidate)
+    except (TypeError, ValueError):
+        return None
+    if parsed.version != 4 or str(parsed) != candidate:
+        return None
+    return candidate
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -6835,7 +6873,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             elif event_type == "tool.completed":
                 file_paths = _workspace_relative_file_paths(kwargs.get("file_paths"))
-                _push({
+                event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
@@ -6843,7 +6881,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
                     "file_paths": file_paths,
-                })
+                }
+                if event["error"]:
+                    request_id = _extract_x_wm_request_id(kwargs.get("result"))
+                    if request_id:
+                        event[_WM_REQUEST_ID_FIELD] = request_id
+                _push(event)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
