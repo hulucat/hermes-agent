@@ -470,6 +470,46 @@ def _enforce_within_workspace(filepath: str, task_id: str = "default") -> str | 
         return f"Unable to validate path against workspace: {exc}"
 
 
+def _read_scope_session_key(task_id: str = "default") -> str:
+    """Return the WorkMate conversation key associated with this Run."""
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        overrides = resolve_task_overrides(task_id) or {}
+        return str(overrides.get("wm_session_id") or task_id)
+    except Exception:
+        return task_id
+
+
+def _enforce_read_scope(
+    filepath: str, task_id: str = "default", tool_name: str = "read_file"
+) -> str | None:
+    """Block WorkMate reads outside the workspace until the user grants access."""
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+        from agent.read_scope import is_allowed
+
+        overrides = resolve_task_overrides(task_id) or {}
+        workspace_root = overrides.get("cwd")
+        if not workspace_root:
+            return None  # Native Hermes sessions retain their existing behavior.
+        resolved = _resolve_path_for_task(filepath, task_id)
+        if is_allowed(
+            resolved,
+            session_key=_read_scope_session_key(task_id),
+            task_id=task_id,
+            workspace_root=workspace_root,
+        ):
+            return None
+        return (
+            f"Access denied: {tool_name} target '{filepath}' is outside the active "
+            "workspace and has not been approved for read access. Ask the user "
+            "to approve this file or directory before retrying."
+        )
+    except Exception as exc:
+        return f"Unable to validate read path against workspace: {exc}"
+
+
 def _file_ops_uses_host_paths(file_ops) -> bool:
     """Return True when *file_ops* targets the same host filesystem as Hermes.
 
@@ -1743,6 +1783,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     "file_size": binary.file_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
+                    "content_is_untrusted": True,
                 }
                 if result_dict["truncated"]:
                     result_dict["hint"] = (
@@ -1802,6 +1843,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         block_error = get_read_block_error(str(_resolved))
         if block_error:
             return tool_error(block_error)
+
+        read_scope_error = _enforce_read_scope(path, task_id, "read_file")
+        if read_scope_error:
+            return tool_error(read_scope_error)
 
         # ── Negative-result cache ─────────────────────────────────────
         # If we already discovered this path doesn't exist (within TTL),
@@ -1874,6 +1919,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
+        if result_dict.get("content"):
+            result_dict["content_is_untrusted"] = True
 
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").
@@ -2611,6 +2658,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return tool_error(block_error)
+        read_scope_error = _enforce_read_scope(path, task_id, "search_files")
+        if read_scope_error:
+            return tool_error(read_scope_error)
 
         # ── Negative-result cache ─────────────────────────────────────
         # Search returns "Path not found: <path>" when the search root
@@ -2636,6 +2686,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, file_read=True)
         result_dict = result.to_dict(densify=True)
+        if result_dict.get("matches") or result_dict.get("files"):
+            result_dict["content_is_untrusted"] = True
 
         if omitted:
             result_dict["_omitted"] = (

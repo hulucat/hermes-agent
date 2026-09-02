@@ -3435,6 +3435,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    allow_once: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3578,6 +3579,7 @@ def _run_approval_gate(
                 "description": redact_sensitive_text(description),
                 "allow_permanent": True,
                 "allow_session": True,
+                "allow_once": allow_once,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -3809,6 +3811,7 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    allow_once: bool = False,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3894,6 +3897,7 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        allow_once=allow_once,
     )
 
 
