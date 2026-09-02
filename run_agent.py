@@ -1439,7 +1439,10 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = get_provider_stale_timeout(
+            getattr(self, "requested_provider", "") or self.provider,
+            self.model,
+        )
         if cfg is not None:
             return cfg, False
 
@@ -1509,7 +1512,10 @@ class AIAgent:
         and the 90s default are implicit — they yield to the wall-clock run
         budget cap; explicit user configuration never does.
         """
-        if get_provider_stale_timeout(self.provider, self.model) is not None:
+        if get_provider_stale_timeout(
+            getattr(self, "requested_provider", "") or self.provider,
+            self.model,
+        ) is not None:
             return True
         return os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
 

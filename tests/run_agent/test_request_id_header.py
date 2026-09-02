@@ -14,6 +14,7 @@ from agent.process_bootstrap import (
     _request_id_event_hooks,
     build_keepalive_http_client,
     request_id_from_error,
+    request_id_from_response,
 )
 from run_agent import AIAgent
 
@@ -119,3 +120,24 @@ def test_error_summary_and_dump_use_only_local_request_id(tmp_path):
     assert payload["request"]["headers"]["X-WM-Request-Id"].startswith("f095")
     assert payload["error"]["request_id"].startswith("f095")
     assert payload["error"]["provider_request_id"] == "provider-controlled-id"
+
+
+def test_response_request_id_uses_only_the_local_request_extension():
+    request = httpx.Request(
+        "POST",
+        "https://partner.test/v1/chat/completions",
+        extensions={
+            "hermes.request_id_header": "X-WM-Request-Id",
+            "hermes.request_id": "f095e9b2-fcd3-41f4-bb9b-9d17f2bfa857",
+        },
+    )
+    response = httpx.Response(
+        200,
+        headers={"x-request-id": "provider-controlled-id"},
+        request=request,
+    )
+
+    assert request_id_from_response(response) == (
+        "X-WM-Request-Id",
+        "f095e9b2-fcd3-41f4-bb9b-9d17f2bfa857",
+    )
