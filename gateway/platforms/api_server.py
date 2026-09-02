@@ -7258,7 +7258,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": ["session", "deny"],
+                        "choices": (
+                            ["once", "session", "deny"]
+                            if event.get("allow_once") else ["session", "deny"]
+                        ),
                     })
                     self._set_run_status(
                         run_id,
@@ -7284,7 +7287,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = run_id
                     approval_token = None
                     session_tokens = []
-                    task_env = {"cwd": workspace_root, "wm_mode": wm_mode}
+                    task_env = {
+                        "cwd": workspace_root,
+                        "wm_mode": wm_mode,
+                        "wm_session_id": session_id,
+                    }
                     from tools.terminal_tool import register_task_env_overrides
 
                     register_task_env_overrides(effective_task_id, task_env)
@@ -7628,11 +7635,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         raw_choice = str(body.get("choice", "")).strip().lower()
         choice = raw_choice
-        allowed = {"session", "deny"}
+        allowed = {"once", "session", "deny"}
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: session, deny",
+                    "Invalid approval choice; expected one of: once, session, deny",
                     code="invalid_approval_choice",
                 ),
                 status=400,

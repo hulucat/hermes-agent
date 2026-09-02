@@ -5983,6 +5983,7 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    allow_once: bool = False
     modified_args: Optional[Dict[str, Any]] = None
 
 
@@ -6087,8 +6088,10 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
+        allow_once = bool(result.get("allow_once")) if action == "approve" else False
         return _PreToolCallDirective(
             action=action, message=message, rule_key=rule_key,
+            allow_once=allow_once,
             modified_args=modified_args,
         )
 
@@ -6221,6 +6224,7 @@ def _resolve_block_from_details(
                     tool_name,
                     details.message or "",
                     rule_key=details.rule_key or tool_name,
+                    allow_once=details.allow_once,
                 )
             finally:
                 if approval_tokens is not None:
