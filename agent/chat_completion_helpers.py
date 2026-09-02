@@ -27,7 +27,10 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    resolve_provider_stale_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason,
@@ -780,6 +783,20 @@ def _report_stale_nonstream_kill(
     """
     model = api_kwargs.get("model", "unknown")
     logger.warning(
+        "event=stale_nonstream_kill elapsed_seconds=%.3f "
+        "effective_threshold_seconds=%.3f threshold_source=%s provider=%s "
+        "model=%s session_id=%s run_id=%s logical_api_request_id=%s "
+        "valid_chunk_count=0 reason=stale_call_kill",
+        elapsed,
+        stale_timeout,
+        _nonstream_stale_timeout_source(agent),
+        getattr(agent, "provider", "") or "-",
+        model,
+        getattr(agent, "session_id", "") or "-",
+        getattr(agent, "run_id", "") or "-",
+        getattr(agent, "_current_api_request_id", "") or "-",
+    )
+    logger.warning(
         "%son-streaming API call stale for %.0fs (threshold %.0fs). "
         "model=%s context=~%s tokens. Killing connection.",
         "Inline n" if inline else "N",
@@ -830,11 +847,7 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
-    if _cfg_stale is not None:
-        _base = _cfg_stale
-    else:
-        _base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
+    _base, _ = _resolve_stream_stale_timeout_base(agent)
     _est_tokens = estimate_request_context_tokens(api_kwargs)
     if _est_tokens > 100_000:
         _timeout = max(_base, 300.0)
@@ -856,6 +869,39 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     if _reasoning_floor is not None:
         _timeout = max(_timeout, _reasoning_floor)
     return _timeout
+
+
+def _resolve_stream_stale_timeout_base(agent) -> tuple[float, str]:
+    """Resolve the stream stale base and a bounded diagnostic source label."""
+    configured = resolve_provider_stale_timeout(
+        _stale_timeout_provider_id(agent), agent.model
+    )
+    if configured is not None:
+        timeout, source = configured
+        return timeout, source
+    return (
+        env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0),
+        "env" if "HERMES_STREAM_STALE_TIMEOUT" in os.environ else "default",
+    )
+
+
+def _nonstream_stale_timeout_source(agent) -> str:
+    """Return the configured source label without changing stale resolution."""
+    configured = resolve_provider_stale_timeout(
+        _stale_timeout_provider_id(agent), agent.model
+    )
+    if configured is not None:
+        return configured[1]
+    if "HERMES_API_CALL_STALE_TIMEOUT" in os.environ:
+        return "env"
+    return "default_or_floor"
+
+
+def _stale_timeout_provider_id(agent) -> str:
+    """Prefer the requested named provider over its generic runtime class."""
+    return str(
+        getattr(agent, "requested_provider", "") or getattr(agent, "provider", "")
+    )
 
 
 def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
@@ -3622,7 +3668,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # threshold instead of burning another stale-timeout×retries cycle.
     _check_stale_giveup(agent)
 
-    request_client_holder = {"client": None, "diag": None, "owner_tid": None}
+    request_client_holder = {
+        "client": None,
+        "diag": None,
+        "owner_tid": None,
+        "x_wm_request_id": None,
+    }
     # Transport kind of the registered request client — see the non-streaming
     # variant. Routes _close_request_client_once to anthropic vs openai abort/
     # close helpers (#67142). ``kind="stream"`` registers a per-request
@@ -3745,6 +3796,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # resolved, so the builder degrades to its plain default if it ever runs
     # first.
     _stream_stale_timeout = None
+    _stream_stale_timeout_source = "default"
     stream_attempt_lock = threading.Lock()
     stream_attempt_state = {
         "current": 0,
@@ -3798,6 +3850,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _stream_attempt_was_cancelled(stream_attempt_id: int) -> bool:
         with stream_attempt_lock:
             return stream_attempt_id in stream_attempt_state["cancelled"]
+
+    def _current_stream_attempt() -> int:
+        with stream_attempt_lock:
+            return int(stream_attempt_state.get("current") or 0)
 
     def _discard_stale_stream_chunk(stream_attempt_id: int, chunk) -> None:
         try:
@@ -3932,6 +3988,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
             attempt_stream_response["value"] = response
+            try:
+                from agent.process_bootstrap import request_id_from_response
+
+                request_id = request_id_from_response(response)
+                if request_id is not None and request_id[0].lower() == "x-wm-request-id":
+                    request_client_holder["x_wm_request_id"] = request_id[1]
+            except Exception:
+                logger.debug("stream request ID capture failed", exc_info=True)
             agent._capture_rate_limits(response)
             agent._capture_credits(response)
             agent._stream_diag_capture_response(_diag, response)
@@ -4053,6 +4117,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
+                _diag["last_chunk_at"] = last_chunk_time["t"]
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -4573,6 +4638,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
                         _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _diag["last_chunk_at"] = last_chunk_time["t"]
                     _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(event)
                 except Exception:
                     pass
@@ -5026,12 +5092,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 else "stream_error_cleanup"
             )
 
-    # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
-    if _cfg_stale is not None:
-        _stream_stale_timeout_base = _cfg_stale
-    else:
-        _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
+    # Provider-configured stale timeout takes priority over the env default.
+    _stream_stale_timeout_base, _stream_stale_timeout_source = _resolve_stream_stale_timeout_base(agent)
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
     # for prefill on large contexts, so tolerate far longer silence than
     # the cloud default — but a wedged local server must EVENTUALLY trip the
@@ -5057,6 +5119,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         except Exception:
             pass
         _stream_stale_timeout = env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", _local_default)
+        _stream_stale_timeout_source = "local_provider"
         logger.debug(
             "Local provider detected (%s) — stale stream timeout set to %.0fs",
             agent.base_url, _stream_stale_timeout,
@@ -5069,11 +5132,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # spurious RemoteProtocolError ("peer closed connection").
         _est_tokens = estimate_request_context_tokens(api_kwargs)
         if _est_tokens > 100_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+            _context_floor = 300.0
         elif _est_tokens > 50_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+            _context_floor = 240.0
         else:
-            _stream_stale_timeout = _stream_stale_timeout_base
+            _context_floor = 0.0
+        _stream_stale_timeout = max(_stream_stale_timeout_base, _context_floor)
+        if _context_floor > _stream_stale_timeout_base:
+            _stream_stale_timeout_source = "context_floor"
         # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
         # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
         # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
@@ -5084,6 +5150,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
         _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
         if _reasoning_floor is not None:
+            if _reasoning_floor > _stream_stale_timeout:
+                _stream_stale_timeout_source = "reasoning_floor"
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
@@ -5135,6 +5203,34 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
+            _diag = request_client_holder.get("diag")
+            _chunks = int(_diag.get("chunks", 0)) if isinstance(_diag, dict) else 0
+            _last_chunk_at = _diag.get("last_chunk_at") if isinstance(_diag, dict) else None
+            _last_chunk_value = (
+                f"{float(_last_chunk_at):.3f}"
+                if isinstance(_last_chunk_at, (int, float))
+                else "-"
+            )
+            logger.warning(
+                "event=stale_stream_kill elapsed_seconds=%.3f "
+                "effective_threshold_seconds=%.3f threshold_source=%s provider=%s "
+                "model=%s session_id=%s run_id=%s logical_api_request_id=%s "
+                "x_wm_request_id=%s stream_attempt=%s max_attempts=%s "
+                "last_valid_chunk_at=%s valid_chunk_count=%s reason=stale_stream_kill",
+                _stale_elapsed,
+                _stream_stale_timeout,
+                _stream_stale_timeout_source,
+                getattr(agent, "provider", "") or "-",
+                api_kwargs.get("model", "unknown"),
+                getattr(agent, "session_id", "") or "-",
+                getattr(agent, "run_id", "") or "-",
+                getattr(agent, "_current_api_request_id", "") or "-",
+                request_client_holder.get("x_wm_request_id") or "-",
+                _current_stream_attempt(),
+                env_int("HERMES_STREAM_RETRIES", 2) + 1,
+                _last_chunk_value,
+                _chunks,
+            )
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",

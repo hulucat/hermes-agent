@@ -14,6 +14,7 @@ These tests cover the guard added to ``interruptible_streaming_api_call``:
 The harness mirrors tests/run_agent/test_28161_anthropic_stream_pool_cleanup.py.
 """
 
+import logging
 import threading
 
 import httpx
@@ -117,7 +118,7 @@ class TestStreamStaleCircuitBreaker:
         assert agent._consecutive_stale_streams == 0
 
     @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-    def test_stale_kill_increments_streak(self, monkeypatch):
+    def test_stale_kill_increments_streak(self, monkeypatch, caplog):
         """Each stale-stream kill increments the consecutive-stale streak so a
         wedged session eventually trips the breaker."""
         monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.1")
@@ -147,8 +148,18 @@ class TestStreamStaleCircuitBreaker:
         # unblock on the abort to simulate the socket shutdown waking the read.
         agent._abort_request_anthropic_client = lambda *a, **k: unblock.set()
 
-        with pytest.raises(Exception):
-            agent._interruptible_streaming_api_call({})
+        with caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"):
+            with pytest.raises(Exception):
+                agent._interruptible_streaming_api_call({})
 
         # At least one stale kill happened; the streak must have advanced.
         assert agent._consecutive_stale_streams >= 1
+        event = next(
+            record.getMessage()
+            for record in caplog.records
+            if "event=stale_stream_kill" in record.getMessage()
+        )
+        assert "effective_threshold_seconds=0.100" in event
+        assert "threshold_source=env" in event
+        assert "stream_attempt=" in event
+        assert "valid_chunk_count=0" in event

@@ -11,7 +11,9 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 
 
@@ -108,6 +110,93 @@ providers:
 
     agent = _make_agent(tmp_path)
     assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
+
+
+def test_named_custom_provider_stale_timeout_applies_to_both_watchdogs(
+    monkeypatch, tmp_path
+):
+    """WorkMate's ``providers.upstream`` applies after custom normalization."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(
+        tmp_path,
+        """\
+providers:
+  upstream:
+    stale_timeout_seconds: 600
+model:
+  provider: custom:upstream
+""",
+    )
+
+    from agent.chat_completion_helpers import (
+        _derive_stream_stale_timeout,
+        _resolve_stream_stale_timeout_base,
+    )
+    from hermes_cli.timeouts import resolve_provider_stale_timeout
+
+    agent = _make_agent(
+        tmp_path,
+        provider="custom",
+        requested_provider="custom:upstream",
+        base_url="https://gateway.example/v1",
+    )
+
+    assert resolve_provider_stale_timeout("custom:upstream", "gpt-5.5") == (
+        600.0,
+        "provider",
+    )
+    assert agent._compute_non_stream_stale_timeout({"model": "gpt-5.5", "input": "hi"}) == 600.0
+    assert _resolve_stream_stale_timeout_base(agent) == (600.0, "provider")
+    assert _derive_stream_stale_timeout(agent, {"model": "gpt-5.5", "input": "hi"}) == 600.0
+
+
+def test_stale_nonstream_log_contains_correlation_fields_without_payload(
+    monkeypatch, tmp_path, caplog
+):
+    """A stale non-stream call emits safe, queryable diagnostics."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+providers:
+  upstream:
+    stale_timeout_seconds: 600
+""",
+    )
+    from agent.chat_completion_helpers import _report_stale_nonstream_kill
+
+    agent = SimpleNamespace(
+        provider="custom",
+        requested_provider="custom:upstream",
+        model="gpt-5.5",
+        session_id="session-1",
+        run_id="run-1",
+        _current_api_request_id="logical-1",
+        _buffer_status=lambda _message: None,
+    )
+    with caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"):
+        _report_stale_nonstream_kill(
+            agent,
+            {"model": "gpt-5.5", "input": "secret-prompt-must-not-appear"},
+            600.5,
+            600.0,
+        )
+
+    event = next(
+        record.getMessage()
+        for record in caplog.records
+        if "event=stale_nonstream_kill" in record.getMessage()
+    )
+    assert "effective_threshold_seconds=600.000" in event
+    assert "threshold_source=provider" in event
+    assert "provider=custom" in event
+    assert "session_id=session-1" in event
+    assert "run_id=run-1" in event
+    assert "logical_api_request_id=logical-1" in event
+    assert "secret-prompt-must-not-appear" not in event
 
 
 # ── openai-codex gateway-scale stale floor ────────────────────────────────

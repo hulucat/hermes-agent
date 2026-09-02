@@ -257,6 +257,16 @@ def request_id_from_error(error: BaseException) -> tuple[str, str] | None:
     request = getattr(response, "request", None) if response is not None else None
     if request is None:
         request = getattr(error, "request", None)
+    return request_id_from_request(request)
+
+
+def request_id_from_response(response: Any) -> tuple[str, str] | None:
+    """Read only the locally generated request ID attached to a response."""
+    return request_id_from_request(getattr(response, "request", None))
+
+
+def request_id_from_request(request: Any) -> tuple[str, str] | None:
+    """Read a locally generated request ID from an httpx request extension."""
     extensions = getattr(request, "extensions", None)
     if not isinstance(extensions, dict):
         return None
@@ -291,5 +301,6 @@ __all__ = [
     "_get_proxy_for_base_url",
     "build_keepalive_http_client",
     "normalize_request_id_header",
+    "request_id_from_response",
     "request_id_from_error",
 ]
