@@ -2428,6 +2428,10 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     live in the volatile tail of the prompt, and earlier matches could be
     user content (memory snapshots, context files).
     """
+    # Strict privacy prompts have no model/provider identity lines to rewrite;
+    # failover state remains internal to the agent and runtime diagnostics.
+    if getattr(agent, "_prompt_privacy", None) == "strict":
+        return
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return

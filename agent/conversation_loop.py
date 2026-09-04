@@ -1025,7 +1025,38 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted runtime-identity lines are stale."""
+    """Return False when a persisted prompt is stale or violates privacy mode."""
+
+    # Strict privacy prompts intentionally omit the identity lines below, so
+    # there is no model-visible value to compare. Reject a legacy full-surface
+    # prompt once, forcing a rebuild before it can be sent on the wire.
+    if getattr(agent, "_prompt_privacy", None) == "strict":
+        lines = prompt.splitlines()
+        legacy_markers = (
+            "User home directory:",
+            "Current working directory:",
+            "Active Hermes profile:",
+            "Session ID:",
+            "Model:",
+            "Provider:",
+            "Platform:",
+        )
+        # The volatile tail uses ``Conversation started:`` for ordinary
+        # sessions and ``Timezone:`` for timeless Bot Chat sessions.  Select
+        # the last anchor: context files may mention the same labels, while
+        # the generated volatile block is always the final prompt section.
+        timestamp_anchors = ("Conversation started:", "Timezone:")
+        for idx in range(len(lines) - 1, -1, -1):
+            if lines[idx].startswith(timestamp_anchors):
+                return not any(
+                    candidate.startswith(legacy_markers)
+                    for candidate in lines[idx + 1 :]
+                )
+
+        # An old prompt may have neither anchor.  Do not trust a possible
+        # legacy identity line in that case; strict mode must rebuild before
+        # an unknown prompt can reach the model.
+        return not any(candidate.startswith(legacy_markers) for candidate in lines)
 
     def line_value(label: str) -> str:
         """Last matching line wins.

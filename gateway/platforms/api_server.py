@@ -2716,6 +2716,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        enabled_toolsets_override: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2749,6 +2750,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        ``enabled_toolsets_override`` is an internal request-level allowlist.
+        An explicit empty list disables every tool for that Agent; ``None``
+        preserves the platform configuration.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2981,7 +2986,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            list(enabled_toolsets_override)
+            if enabled_toolsets_override is not None
+            else sorted(_get_platform_tools(user_config, "api_server"))
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -4247,6 +4256,12 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        # OpenAI's explicit empty tools array means this request must run
+        # without any tool definitions. Missing ``tools`` keeps the historical
+        # API-server platform toolset, preserving existing clients.
+        no_tools_requested = (
+            isinstance(body.get("tools"), list) and not body.get("tools")
+        )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -4459,6 +4474,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                enabled_toolsets=[] if no_tools_requested else None,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4480,6 +4496,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                enabled_toolsets=[] if no_tools_requested else None,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6439,6 +6456,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        enabled_toolsets: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6500,6 +6518,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        enabled_toolsets_override=enabled_toolsets,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
