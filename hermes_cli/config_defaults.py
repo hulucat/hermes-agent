@@ -207,6 +207,11 @@ DEFAULT_CONFIG = {
         # (docker/modal/ssh — they have their own probe).  Set False to
         # disable entirely.
         "environment_probe": True,
+        # Runtime metadata visibility in the model-visible system prompt.
+        # "strict" (default) omits absolute home/workspace paths, profile and
+        # session identifiers, and model/provider/platform labels. "full" keeps
+        # the historical diagnostics for local troubleshooting only.
+        "prompt_privacy": "strict",
         # Bot Mode teammate-messaging protocol section (silent unless a
         # profile is managed by the desktop's Bot Mode).
         "bot_mode_protocol": True,

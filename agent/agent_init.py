@@ -1760,6 +1760,15 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Keep runtime identity and filesystem paths out of the model-visible
+    # prompt by default. ``full`` is an explicit local-debug escape hatch;
+    # unrecognised values fail closed to strict privacy.
+    _prompt_privacy = str(
+        ((_agent_cfg.get("agent", {}) or {}).get("prompt_privacy", "strict"))
+        or "strict"
+    ).strip().lower()
+    agent._prompt_privacy = "full" if _prompt_privacy == "full" else "strict"
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

@@ -500,8 +500,8 @@ class TestStoredPromptCwdDrift:
 
 
 
-    def test_built_prompt_contains_platform_line(self):
-        """The built system prompt must carry a Platform: line so drift detection works."""
+    def test_built_prompt_omits_platform_line_in_strict_privacy_mode(self):
+        """Strict prompts do not expose platform identity to the model."""
         import tempfile
         from pathlib import Path
         from unittest.mock import patch
@@ -524,7 +524,34 @@ class TestStoredPromptCwdDrift:
                     skip_memory=True,
                 )
             agent.platform = "cli"
+            agent._prompt_privacy = "strict"
             parts = build_system_prompt_parts(agent)
-            assert "Platform: cli" in parts["volatile"], (
-                "Built prompt missing 'Platform: cli' — drift detection cannot read it"
-            )
+            assert "Platform: cli" not in parts["volatile"]
+
+    def test_built_prompt_contains_platform_line_in_full_privacy_mode(self):
+        """Full diagnostic prompts retain the identity used for drift checks."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+        from agent.system_prompt import build_system_prompt_parts
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                agent = AIAgent(
+                    api_key="test-key",
+                    base_url="https://openrouter.ai/api/v1",
+                    model="test/model",
+                    provider="openrouter",
+                    quiet_mode=True,
+                    session_db=db,
+                    session_id="platform-test-full",
+                    skip_context_files=True,
+                    skip_memory=True,
+                )
+            agent.platform = "cli"
+            agent._prompt_privacy = "full"
+            parts = build_system_prompt_parts(agent)
+            assert "Platform: cli" in parts["volatile"]
