@@ -96,6 +96,15 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_successful_envelope_ignores_error_word_in_inline_content(self):
+        result = json.dumps(
+            {
+                "ok": True,
+                "artifacts": [{"inline_content": '{"error":"measurement"}'}],
+            }
+        )
+        assert _detect_tool_failure("python_compute", result) == (False, "")
+
 
 
 class TestGetCuteToolMessageFailureSuffix:
@@ -118,4 +127,3 @@ class TestGetCuteToolMessageFailureSuffix:
         ok = json.dumps({"success": True, "data": "hi"})
         line = get_cute_tool_message("web_search", {"query": "hi"}, 0.2, result=ok)
         assert "[" not in line.split("0.2s", 1)[1]
-

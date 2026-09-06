@@ -1369,6 +1369,11 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         err = data.get("error") or data.get("message")
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
+        # Structured tool envelopes may carry arbitrary inline user data.
+        # Once the top-level contract says ``ok: true`` and has no real error,
+        # do not scan nested content for words such as `"error"`.
+        if data.get("ok") is True:
+            return False, ""
 
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —

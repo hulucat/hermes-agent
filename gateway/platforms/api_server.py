@@ -72,6 +72,8 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 )
 
 _WM_REQUEST_ID_FIELD = "x_wm_request_id"
+_WM_ERROR_FIELD = "x_wm_error"
+_WM_TOOL_ERROR_CODE_PREFIX = "PYTHON_COMPUTE_"
 
 
 def _extract_x_wm_request_id(raw_result: object) -> Optional[str]:
@@ -108,6 +110,46 @@ def _extract_x_wm_request_id(raw_result: object) -> Optional[str]:
     if parsed.version != 4 or str(parsed) != candidate:
         return None
     return candidate
+
+
+def _extract_x_wm_tool_error(raw_result: object) -> Optional[Dict[str, str]]:
+    """Extract the structured error of a failed managed Python Compute result.
+
+    Same minimal-passthrough boundary as ``_extract_x_wm_request_id``: only the
+    managed-tool error envelope (``ok: false`` plus a ``PYTHON_COMPUTE_`` code)
+    yields the three diagnostic fields — the full result is never forwarded, so
+    run-level "latest failure" guessing in the host is no longer needed for
+    attribution when the tool's own envelope is available.
+    """
+    if isinstance(raw_result, str):
+        try:
+            payload = json.loads(raw_result)
+        except (TypeError, ValueError):
+            return None
+    elif isinstance(raw_result, dict):
+        payload = raw_result
+    else:
+        return None
+    if payload.get("ok") is not False:
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if (
+        not isinstance(code, str)
+        or not code.startswith(_WM_TOOL_ERROR_CODE_PREFIX)
+        or not isinstance(message, str)
+        or not message
+    ):
+        return None
+    extracted: Dict[str, str] = {"code": code, "message": message}
+    details = error.get("details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    if isinstance(reason, str) and reason:
+        extracted["reason"] = reason
+    return extracted
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -6905,6 +6947,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     request_id = _extract_x_wm_request_id(kwargs.get("result"))
                     if request_id:
                         event[_WM_REQUEST_ID_FIELD] = request_id
+                    tool_error = _extract_x_wm_tool_error(kwargs.get("result"))
+                    if tool_error:
+                        event[_WM_ERROR_FIELD] = tool_error
                 _push(event)
             elif event_type == "reasoning.available":
                 _push({
@@ -7010,9 +7055,12 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         wm_mode = body.get("mode")
-        if wm_mode not in {"ask", "craft", "plan"}:
+        # ``visualize`` is an internal WorkMate read-only runtime state, not a
+        # user-selectable task mode. The public product contract remains
+        # ``execute``/``plan``.
+        if wm_mode not in {"execute", "plan", "visualize"}:
             return web.json_response(
-                _openai_error("'mode' must be one of: ask, craft, plan"),
+                _openai_error("'mode' must be one of: execute, plan, visualize"),
                 status=400,
             )
 
@@ -7674,18 +7722,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
+        request_id = body.get("request_id")
+        if request_id is not None:
+            request_id = str(request_id).strip() or None
         resolve_all = (
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import resolve_gateway_approval_with_ids
 
-            resolved = resolve_gateway_approval(
+            resolved_request_ids = resolve_gateway_approval_with_ids(
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                request_id=request_id,
             )
+            resolved = len(resolved_request_ids)
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
@@ -7700,16 +7753,20 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         self._set_run_status(run_id, "running", last_event="approval.responded")
+        response_event = {
+            "event": "approval.responded",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "choice": choice,
+            "resolved": resolved,
+            "request_ids": resolved_request_ids,
+        }
+        if len(resolved_request_ids) == 1:
+            response_event["request_id"] = resolved_request_ids[0]
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
+                q.put_nowait(response_event)
             except Exception:
                 pass
 
@@ -7718,6 +7775,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+            "request_ids": resolved_request_ids,
         })
 
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":

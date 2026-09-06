@@ -81,6 +81,17 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
     assert controller.halt_decision is None
 
 
+def test_structured_success_does_not_treat_inline_error_word_as_failure():
+    result = json.dumps(
+        {
+            "ok": True,
+            "artifacts": [{"inline_content": '{"error":"measurement"}'}],
+        }
+    )
+
+    assert classify_tool_failure("python_compute", result) == (False, "")
+
+
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
@@ -167,7 +178,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

@@ -156,7 +156,7 @@ class TestDrainWaitsForApiWork:
                     json={
                         "input": "hello",
                         "workspace_root": str(Path.cwd()),
-                        "mode": "ask",
+                        "mode": "execute",
                     },
                 )
                 assert response.status == 202
