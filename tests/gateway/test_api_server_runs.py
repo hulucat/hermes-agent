@@ -26,6 +26,7 @@ from gateway.platforms.api_server import (
     MAX_RUN_REASONING_SEGMENT_CHARS,
     _approval_event_choices,
     _extract_x_wm_request_id,
+    _extract_x_wm_tool_error,
     cors_middleware,
     security_headers_middleware,
 )
@@ -99,6 +100,40 @@ def test_extract_x_wm_request_id_accepts_one_canonical_uuid4(result, expected):
     assert _extract_x_wm_request_id(json.dumps(result)) == expected
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            {
+                "contract_version": "0.2",
+                "ok": False,
+                "error": {
+                    "code": "PYTHON_COMPUTE_OUTPUT_REJECTED",
+                    "message": "rejected",
+                    "retryable": False,
+                    "details": {"reason": "required_output_missing"},
+                },
+            },
+            {
+                "code": "PYTHON_COMPUTE_OUTPUT_REJECTED",
+                "message": "rejected",
+                "reason": "required_output_missing",
+            },
+        ),
+        # 成功信封(ok:true 或无 error)不提取
+        ({"ok": True, "error": None}, None),
+        ({"ok": False, "error": {"code": "WEB_TOOL_REJECTED", "message": "x"}}, None),
+        ({"ok": False, "error": {"code": "PYTHON_COMPUTE_X", "message": ""}}, None),
+        ({"error": {"code": "PYTHON_COMPUTE_X", "message": "x"}}, None),
+        ("not-json", None),
+        (None, None),
+    ],
+)
+def test_extract_x_wm_tool_error_only_accepts_managed_envelope(result, expected):
+    # dict 直接传入;字符串走 JSON 解析路径("not-json" 覆盖解析失败)。
+    assert _extract_x_wm_tool_error(result) == expected
+
+
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
@@ -130,7 +165,7 @@ def _run_body(**fields):
     body = {
         "input": "hello",
         "workspace_root": str(Path.cwd()),
-        "mode": "ask",
+        "mode": "execute",
     }
     body.update(fields)
     return body
@@ -187,9 +222,9 @@ class TestStartRun:
     @pytest.mark.parametrize(
         "body,error_field",
         [
-            ({"input": "hello", "mode": "ask"}, "workspace_root"),
+            ({"input": "hello", "mode": "execute"}, "workspace_root"),
             (
-                {"input": "hello", "workspace_root": "relative", "mode": "ask"},
+                {"input": "hello", "workspace_root": "relative", "mode": "execute"},
                 "workspace_root",
             ),
             (
@@ -205,6 +240,22 @@ class TestStartRun:
                     "input": "hello",
                     "workspace_root": str(Path.cwd()),
                     "mode": "ask",
+                },
+                "mode",
+            ),
+            (
+                {
+                    "input": "hello",
+                    "workspace_root": str(Path.cwd()),
+                    "mode": "craft",
+                },
+                "mode",
+            ),
+            (
+                {
+                    "input": "hello",
+                    "workspace_root": str(Path.cwd()),
+                    "mode": "execute",
                     "include_reasoning": "true",
                 },
                 "include_reasoning",
@@ -224,7 +275,8 @@ class TestStartRun:
         assert adapter._run_statuses == {}
 
     @pytest.mark.asyncio
-    async def test_start_returns_202(self, adapter):
+    @pytest.mark.parametrize("mode", ["execute", "plan", "visualize"])
+    async def test_start_returns_202(self, adapter, mode):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
@@ -235,7 +287,7 @@ class TestStartRun:
                 mock_agent.session_total_tokens = 15
                 mock_create.return_value = mock_agent
 
-                resp = await cli.post("/v1/runs", json=_run_body())
+                resp = await cli.post("/v1/runs", json=_run_body(mode=mode))
                 assert resp.status == 202
                 data = await resp.json()
                 assert data["status"] == "started"
@@ -449,7 +501,7 @@ class TestRunEvents:
                             session_id="shared-session",
                         ),
                     )
-                    for index, mode in enumerate(("ask", "craft"))
+                    for index, mode in enumerate(("execute", "plan"))
                 ]
                 run_ids = [(await response.json())["run_id"] for response in responses]
                 for run_id in run_ids:
@@ -457,8 +509,8 @@ class TestRunEvents:
 
         assert {item[0] for item in captured} == set(run_ids)
         assert {(item[1], item[2], item[3]) for item in captured} == {
-            (str(workspaces[0].resolve()), "ask", str(workspaces[0].resolve())),
-            (str(workspaces[1].resolve()), "craft", str(workspaces[1].resolve())),
+            (str(workspaces[0].resolve()), "execute", str(workspaces[0].resolve())),
+            (str(workspaces[1].resolve()), "plan", str(workspaces[1].resolve())),
         }
         from tools.terminal_tool import resolve_task_overrides
 
@@ -657,6 +709,64 @@ class TestRunEvents:
         ]
         completed = next(event for event in events if event["event"] == "tool.completed")
         assert completed["x_wm_request_id"] == request_id
+        assert "must-not-leak" not in body
+
+    @pytest.mark.asyncio
+    async def test_failed_managed_tool_event_carries_structured_error(
+        self, adapter
+    ):
+        """受管 Python Compute 失败事件携带最小结构化错误,供宿主精确归因。"""
+        envelope = {
+            "contract_version": "0.2",
+            "ok": False,
+            "execution_id": "pce_" + "a" * 32,
+            "state": "failed",
+            "artifacts": [],
+            "error": {
+                "code": "PYTHON_COMPUTE_OUTPUT_REJECTED",
+                "message": "validated artifacts rejected",
+                "retryable": False,
+                "details": {"reason": "required_output_missing"},
+            },
+        }
+
+        def _create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_run_kwargs):
+                kwargs["tool_progress_callback"](
+                    "tool.completed",
+                    "python_compute",
+                    duration=0.1,
+                    is_error=True,
+                    result=json.dumps({**envelope, "secret": "must-not-leak"}),
+                )
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                response = await cli.post("/v1/runs", json=_run_body())
+                run_id = (await response.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed = next(event for event in events if event["event"] == "tool.completed")
+        assert completed["x_wm_error"] == {
+            "code": "PYTHON_COMPUTE_OUTPUT_REJECTED",
+            "message": "validated artifacts rejected",
+            "reason": "required_output_missing",
+        }
         assert "must-not-leak" not in body
 
     @pytest.mark.asyncio

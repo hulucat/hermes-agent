@@ -2531,6 +2531,68 @@ class TestModelRoutesHandlers:
 
 class TestModelRoutesAgentCreation:
 
+    @pytest.mark.parametrize(
+        "selection",
+        ["default", "request", "route", "session", "session_override"],
+    )
+    def test_named_custom_provider_survives_model_selection(
+        self, monkeypatch, tmp_path, selection,
+    ):
+        """Resolve a real profile without losing the named endpoint or key."""
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        captured = {}
+        config = {
+            "model": {"provider": "custom:upstream", "default": "global/model"},
+            "providers": {
+                "previous": {
+                    "base_url": "https://previous.example/v1",
+                    "api_key": "sk-previous",
+                },
+                "upstream": {
+                    "base_url": "https://upstream.example/v1",
+                    "api_key": "sk-upstream",
+                },
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            _resolve_runtime_agent_kwargs,
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        selected_model = "new-provider-model"
+        session_override = (
+            {"model": selected_model} if selection == "session_override" else None
+        )
+        monkeypatch.setattr(
+            adapter, "_session_model_override_for", lambda *_: session_override,
+        )
+        request_kwargs = {
+            "default": {},
+            "request": {"requested_model": selected_model},
+            "route": {"route": {"model": selected_model}},
+            "session": {"session_model": selected_model},
+            "session_override": {"requested_model": "ignored-request-model"},
+        }[selection]
+
+        adapter._create_agent(session_id="s1", **request_kwargs)
+
+        assert captured["model"] == (
+            "global/model" if selection == "default" else selected_model
+        )
+        assert captured["provider"] == "custom"
+        assert captured["api_key"] == "sk-upstream"
+        assert captured["base_url"] == "https://upstream.example/v1"
+
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}
 

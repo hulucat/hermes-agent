@@ -15,6 +15,7 @@ import functools
 import hashlib
 import logging
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -772,7 +773,12 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # =========================================================================
 
 DANGEROUS_PATTERNS = [
-    (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
+    # Absolute deletes are dangerous on both POSIX and Windows shells.  The
+    # drive-prefix form also covers `rm -f C:\\...` under Git Bash/WSL.  Home-
+    # relative operands (`rm -rf ~/project`) stay on the plain "recursive
+    # delete" rule below — labeling every `~/...` path a root delete both
+    # overstates the risk and breaks the pinned upstream verdicts.
+    (r'\brm\s+(-[^\s]*\s+)*(?:/|[A-Za-z]:[\\/])', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
     # GNU rm permutes options, so a recursive flag group may legally FOLLOW
@@ -2300,17 +2306,21 @@ def _command_detection_variants(command: str):
 def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
-        argv = shlex.split(command, posix=True)
+        argv = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return False
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
 
     operand = argv[2]
-    configured_temp_dir = os.path.abspath(tempfile.gettempdir())
-    temp_dir = os.path.realpath(configured_temp_dir)
+    configured_temp_dir = tempfile.gettempdir()
+    # Keep POSIX fixtures POSIX-normalized even when this test suite runs on
+    # Windows; real Windows temp directories continue through ntpath/os.path.
+    path_ops = posixpath if configured_temp_dir.startswith("/") and operand.startswith("/") else os.path
+    configured_temp_dir = path_ops.abspath(configured_temp_dir)
+    temp_dir = path_ops.realpath(configured_temp_dir)
     basename = os.path.basename(operand)
-    if os.path.normpath(operand) != operand:
+    if path_ops.normpath(operand) != operand:
         return False
 
     operand_dir = os.path.dirname(operand)
@@ -2324,8 +2334,8 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     if operand_dir not in allowed_dirs:
         return False
 
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
+    target = path_ops.realpath(operand)
+    if path_ops.dirname(target) != temp_dir:
         return False
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
@@ -2643,6 +2653,36 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def _resolve_gateway_approval_entries(session_key: str, choice: str,
+                                      resolve_all: bool = False,
+                                      reason: Optional[str] = None,
+                                      request_id: Optional[str] = None) -> list[_ApprovalEntry]:
+    """Remove and resolve queue entries, returning the exact entries consumed."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return []
+        if request_id:
+            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+            if not targets:
+                return []
+            queue[:] = [entry for entry in queue if entry not in targets]
+        elif resolve_all:
+            targets = list(queue)
+            queue.clear()
+        else:
+            targets = [queue.pop(0)]
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+    for entry in targets:
+        entry.result = choice
+        if reason:
+            entry.reason = reason
+        entry.event.set()
+    return targets
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
@@ -2660,29 +2700,30 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
-    with _lock:
-        queue = _gateway_queues.get(session_key)
-        if not queue:
-            return 0
-        if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
-            if not targets:
-                return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
-        elif resolve_all:
-            targets = list(queue)
-            queue.clear()
-        else:
-            targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+    return len(_resolve_gateway_approval_entries(
+        session_key,
+        choice,
+        resolve_all=resolve_all,
+        reason=reason,
+        request_id=request_id,
+    ))
 
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
-    return len(targets)
+
+def resolve_gateway_approval_with_ids(session_key: str, choice: str,
+                                      resolve_all: bool = False,
+                                      reason: Optional[str] = None,
+                                      request_id: Optional[str] = None) -> list[str]:
+    """Resolve approvals and return the upstream request IDs actually consumed."""
+    return [
+        str(entry.data["request_id"])
+        for entry in _resolve_gateway_approval_entries(
+            session_key,
+            choice,
+            resolve_all=resolve_all,
+            reason=reason,
+            request_id=request_id,
+        )
+    ]
 
 
 def list_gateway_approvals(session_key: str) -> list[dict]:
