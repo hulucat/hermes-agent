@@ -74,6 +74,21 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 _WM_REQUEST_ID_FIELD = "x_wm_request_id"
 _WM_ERROR_FIELD = "x_wm_error"
 _WM_TOOL_ERROR_CODE_PREFIX = "PYTHON_COMPUTE_"
+_WM_SESSION_APPROVAL_CATEGORIES = frozenset(
+    {"workspace_write", "python_compute", "publish_artifact"}
+)
+
+
+def _normalize_wm_session_approval_categories(raw: object) -> list[str]:
+    """Keep only the bounded WorkMate categories understood by Hermes plugins."""
+    if not isinstance(raw, list):
+        return []
+    return [
+        category
+        for category in raw
+        if isinstance(category, str)
+        and category in _WM_SESSION_APPROVAL_CATEGORIES
+    ]
 
 
 def _extract_x_wm_request_id(raw_result: object) -> Optional[str]:
@@ -7364,6 +7379,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "cwd": workspace_root,
                         "wm_mode": wm_mode,
                         "wm_session_id": session_id,
+                        "wm_approved_tool_categories": _normalize_wm_session_approval_categories(
+                            body.get("wm_approved_tool_categories", [])
+                        ),
                     }
                     from tools.terminal_tool import register_task_env_overrides
 
