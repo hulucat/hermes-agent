@@ -4848,6 +4848,23 @@ def run_conversation(
                         agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
                         continue
                 if (
+                    agent.api_mode == "chat_completions"
+                    and agent.provider == "custom"
+                    and status_code == 401
+                    and not _retry.custom_credential_retry_attempted
+                ):
+                    # PATCH-026: WorkMate's managed custom provider carries a
+                    # short-TTL dotenv key; re-read it (re-signing through the
+                    # host's loopback bridge when the on-disk value is stale)
+                    # and rebuild the client so a long run survives the token
+                    # boundary instead of failing the turn.
+                    _retry.custom_credential_retry_attempted = True
+                    if agent._try_refresh_custom_provider_credentials():
+                        agent._buffer_vprint(
+                            "🔐 Upstream credential refreshed after 401. Retrying request..."
+                        )
+                        continue
+                if (
                     agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"
                     and status_code == 401

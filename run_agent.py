@@ -6090,6 +6090,108 @@ class AIAgent:
         )
         return True
 
+    def _try_refresh_custom_provider_credentials(self) -> bool:
+        """Refresh a named custom provider's key on 401 (PATCH-026).
+
+        WorkMate's managed ``custom:<name>`` provider rides a short-TTL
+        data-plane token in dotenv. Long-lived runs outlive it, so the next
+        model call 401s mid-turn. This re-reads the ``key_env`` value (the
+        host backend atomically rewrites ``.env`` on re-issue); when unchanged,
+        it asks the backend's loopback credential-refresh bridge to re-sign on
+        our behalf and re-reads again. A changed key is adopted in place and
+        the shared client rebuilt — no process restart, the run keeps going.
+        Mirrors the vertex/copilot 401 recovery branches.
+        """
+        if self.api_mode != "chat_completions":
+            return False
+        if (getattr(self, "provider", "") or "").strip().lower() != "custom":
+            return False
+        try:
+            from agent.credential_pool import get_env_prefer_dotenv
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+        except ImportError:
+            return False
+        custom_provider = _get_named_custom_provider(
+            getattr(self, "requested_provider", "") or ""
+        )
+        if not custom_provider:
+            return False
+        key_env = str(custom_provider.get("key_env") or "").strip()
+        if not key_env:
+            # Inline-key / pool-backed custom providers have no env-sourced
+            # credential to re-read.
+            return False
+
+        def _read_key() -> str:
+            return get_env_prefer_dotenv(key_env).strip()
+
+        api_key = _read_key()
+        if api_key and api_key != self.api_key:
+            return self._adopt_custom_provider_key(api_key)
+
+        # On-disk key unchanged: ask the host backend to re-sign (loopback-only
+        # bridge; failure here just means the caller surfaces the original 401).
+        bridge_url = get_env_prefer_dotenv("HL_WM_CREDENTIAL_REFRESH_URL").strip()
+        bridge_token = get_env_prefer_dotenv("HL_WM_CREDENTIAL_REFRESH_TOKEN").strip()
+        if bridge_url and bridge_token:
+            try:
+                import httpx
+
+                response = httpx.post(
+                    bridge_url,
+                    json={"token": bridge_token},
+                    timeout=httpx.Timeout(5.0, read=15.0),
+                    trust_env=False,
+                )
+                if 200 <= response.status_code < 300:
+                    api_key = _read_key()
+                else:
+                    logger.info(
+                        "WorkMate credential bridge rejected refresh: "
+                        "status=%s provider=%s",
+                        response.status_code,
+                        getattr(self, "requested_provider", ""),
+                    )
+            except Exception as exc:  # noqa: BLE001 -- bridge is best-effort
+                logger.info(
+                    "WorkMate credential bridge call failed: %s", exc
+                )
+        if api_key and api_key != self.api_key:
+            return self._adopt_custom_provider_key(api_key)
+        return False
+
+    def _adopt_custom_provider_key(self, api_key: str) -> bool:
+        """Swap the adopted custom-provider key and rebuild the shared client."""
+        prior_api_key = self.api_key
+        prior_client_kwargs = dict(self._client_kwargs)
+        self.api_key = api_key
+        self._client_kwargs["api_key"] = self.api_key
+        # Key-only edit on a config-pinned endpoint; recompute route-derived
+        # kwargs anyway so this path cannot drift from the env-refresh path.
+        self._reapply_route_client_config(route_changed=False)
+        if not self._replace_primary_openai_client(
+            reason="custom_provider_credential_refresh"
+        ):
+            # Roll back so agent state keeps matching the still-live old client.
+            self.api_key = prior_api_key
+            self._client_kwargs.clear()
+            self._client_kwargs.update(prior_client_kwargs)
+            return False
+        try:
+            from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+
+            sync_credential_pool_entry_id(self)
+        except Exception:
+            logger.debug(
+                "sync_credential_pool_entry_id after custom refresh failed",
+                exc_info=True,
+            )
+        logger.info(
+            "Applied refreshed custom provider credential for %s",
+            getattr(self, "requested_provider", "") or self.provider,
+        )
+        return True
+
     def _try_refresh_vertex_client_credentials(self) -> bool:
         """Re-mint the Vertex OAuth2 access token and rebuild the OpenAI client.
 
