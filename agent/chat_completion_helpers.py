@@ -56,6 +56,11 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+# Contract-stable cloud error-code words → HTTP status (PATCH-026). Only codes
+# the partner API spec pins to a status belong here; extend deliberately.
+_ERROR_CODE_WORD_STATUS = {
+    "UNAUTHORIZED": 401,
+}
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -152,6 +157,14 @@ def _status_code_from_value(value: Any) -> Optional[int]:
         return value
     if not isinstance(value, str):
         return None
+    # Stable cloud error-code words (PATCH-026): the WorkMate partner data plane
+    # surfaces auth failures mid-stream as SSE ``error`` events whose only
+    # machine-readable signal is the code string — no numeric status anywhere in
+    # the payload. Map the contract-stable codes to their HTTP status so the
+    # retry ladder (401 credential recovery etc.) can classify them.
+    normalized = value.strip().upper()
+    if normalized in _ERROR_CODE_WORD_STATUS:
+        return _ERROR_CODE_WORD_STATUS[normalized]
     match = re.search(r"(?:HTTP_STATUS/)?\b([1-5]\d\d)\b", value, re.IGNORECASE)
     if not match:
         return None

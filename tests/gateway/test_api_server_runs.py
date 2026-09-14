@@ -27,6 +27,7 @@ from gateway.platforms.api_server import (
     _approval_event_choices,
     _extract_x_wm_request_id,
     _extract_x_wm_tool_error,
+    _normalize_wm_session_approval_categories,
     cors_middleware,
     security_headers_middleware,
 )
@@ -36,6 +37,13 @@ from tools import approval as approval_mod
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_normalize_wm_session_approval_categories_is_bounded() -> None:
+    assert _normalize_wm_session_approval_categories(
+        ["workspace_write", "python_compute", "unknown", 1]
+    ) == ["workspace_write", "python_compute"]
+    assert _normalize_wm_session_approval_categories(None) == []
 
 
 @pytest.mark.parametrize(

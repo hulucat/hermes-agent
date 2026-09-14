@@ -54,6 +54,10 @@ class TurnRetryState:
     # so both can fire within one attempt if needed.
     copilot_stale_cred_retry_attempted: bool = False
     vertex_auth_retry_attempted: bool = False
+    # Named custom providers (WorkMate's managed ``custom:upstream``) carry a
+    # short-TTL data-plane key in dotenv; PATCH-026 re-reads it (optionally via
+    # the host's loopback re-sign bridge) and rebuilds the client on 401.
+    custom_credential_retry_attempted: bool = False
 
     # ── Format / payload recovery guards ─────────────────────────────────
     thinking_sig_retry_attempted: bool = False
