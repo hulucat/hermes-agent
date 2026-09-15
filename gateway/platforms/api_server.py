@@ -128,13 +128,19 @@ def _extract_x_wm_request_id(raw_result: object) -> Optional[str]:
 
 
 def _extract_x_wm_tool_error(raw_result: object) -> Optional[Dict[str, str]]:
-    """Extract the structured error of a failed managed Python Compute result.
+    """Extract the structured error of a failed managed tool result.
 
-    Same minimal-passthrough boundary as ``_extract_x_wm_request_id``: only the
-    managed-tool error envelope (``ok: false`` plus a ``PYTHON_COMPUTE_`` code)
-    yields the three diagnostic fields — the full result is never forwarded, so
-    run-level "latest failure" guessing in the host is no longer needed for
-    attribution when the tool's own envelope is available.
+    Same minimal-passthrough boundary as ``_extract_x_wm_request_id``: the full
+    result is never forwarded, so run-level "latest failure" guessing in the
+    host is no longer needed for attribution when the tool's own envelope is
+    available. Two envelope shapes yield fields (PATCH-027):
+
+    * Managed Python Compute: ``ok: false`` plus a ``PYTHON_COMPUTE_`` code
+      and optional ``details.reason``.
+    * Generic tool errors: ``{"error": "<text>", "code": "<WORKSPACE_*>"}`` —
+      e.g. write_file/patch stage codes. Without a code the text still rides
+      as ``HERMES_TOOL_ERROR`` (bounded) so the host failure envelope stops
+      collapsing to a boolean; unknown codes are validated host-side.
     """
     if isinstance(raw_result, str):
         try:
@@ -146,7 +152,21 @@ def _extract_x_wm_tool_error(raw_result: object) -> Optional[Dict[str, str]]:
     else:
         return None
     if payload.get("ok") is not False:
-        return None
+        if payload.get("ok") is True:
+            return None
+        # PATCH-027: plain tool-error envelope ({"error": str, "code"?}) —
+        # no ``ok`` marker. Only strings qualify; dict errors keep the
+        # managed path below.
+        error = payload.get("error")
+        if not isinstance(error, str) or not error.strip():
+            return None
+        code = payload.get("code")
+        if code is not None and (not isinstance(code, str) or not code.strip()):
+            return None
+        return {
+            "code": (code or "HERMES_TOOL_ERROR").strip(),
+            "message": error[:400],
+        }
     error = payload.get("error")
     if not isinstance(error, dict):
         return None

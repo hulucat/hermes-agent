@@ -2292,6 +2292,43 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     return None
 
 
+# ── PATCH-027: workspace write failure stage codes ──────────────────────────
+# write_file/patch failures ride the tool-error envelope as {"error": ..., "code": ...}
+# so the WorkMate relay can carry a stable failure stage across the SSE boundary
+# instead of collapsing to a boolean. Codes are a fork-WorkMate contract — keep in
+# sync with hlmate-backend app/workmate/workspace_tool_contracts.py (COUPLE note in
+# hlmate-docs/maintenance/hermes-fork-patches.md).
+def _write_tool_error(message: str, code: str) -> str:
+    """tool_error with a stable workspace-write failure stage code (PATCH-027)."""
+    return tool_error(message, code=code)
+
+
+def _shell_write_error_code(error_text: str) -> str:
+    """Classify ShellFileOperations write failures by their fixed fork prefixes.
+
+    The prefixes below are this fork's own message contracts (see
+    tools/file_operations.py write_file); anything unmatched — including bare
+    OSError/errno text — is INTERNAL.
+    """
+    text = str(error_text or "")
+    if text.startswith("Write denied:"):
+        return "WORKSPACE_WRITE_DENIED"
+    if text.startswith("Failed to write file:"):
+        return "WORKSPACE_ATOMIC_WRITE"
+    if text.startswith("Post-write verification failed"):
+        return "WORKSPACE_POST_VERIFY"
+    if "syntax validation" in text:
+        return "WORKSPACE_VALIDATION"
+    return "WORKSPACE_INTERNAL"
+
+
+def _stamp_write_error_code(result_dict: dict) -> dict:
+    """Attach the stage code to a shell-layer write failure in place (PATCH-027)."""
+    if result_dict.get("error"):
+        result_dict["code"] = _shell_write_error_code(result_dict["error"])
+    return result_dict
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2305,28 +2342,29 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     """
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
-        return tool_error(sensitive_err)
+        return _write_tool_error(sensitive_err, "WORKSPACE_SENSITIVE_PATH")
     workspace_err = _enforce_within_workspace(path, task_id)
     if workspace_err:
-        return tool_error(workspace_err)
+        return _write_tool_error(workspace_err, "WORKSPACE_PATH_ESCAPE")
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
-        return tool_error(binary_doc_err)
+        return _write_tool_error(binary_doc_err, "WORKSPACE_BINARY_DOCUMENT")
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
-        return tool_error(protected_err)
+        return _write_tool_error(protected_err, "WORKSPACE_APPROVAL_DENIED")
     approval_err = _check_approval_required_write([path], task_id)
     if approval_err:
-        return tool_error(approval_err)
+        return _write_tool_error(approval_err, "WORKSPACE_APPROVAL_DENIED")
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
-            return tool_error(cross_warning)
+            return _write_tool_error(cross_warning, "WORKSPACE_CROSS_PROFILE")
     if _is_internal_file_tool_content(content):
-        return tool_error(
+        return _write_tool_error(
             "Refusing to write internal read_file display text as file content. "
             "Strip read_file line-number prefixes or reconstruct the intended "
-            "file contents before writing."
+            "file contents before writing.",
+            "WORKSPACE_PARAM_INVALID",
         )
     try:
         # Resolve once for the registry lock + stale check.  Failures here
@@ -2346,6 +2384,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 result_dict["_warning"] = stale_warning
             if not result_dict.get("error"):
                 _mark_verification_stale(task_id, [path], session_id=session_id)
+            else:
+                _stamp_write_error_code(result_dict)
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -2378,13 +2418,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
+            else:
+                _stamp_write_error_code(result_dict)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
-        return tool_error(str(e))
+        return _write_tool_error(str(e), "WORKSPACE_INTERNAL")
 
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
@@ -2418,11 +2460,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # because the agent uses relative ``..`` paths legitimately
             # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
             if has_traversal_component(v4a_path):
-                return tool_error(
+                return _write_tool_error(
                     f"V4A patch header contains '..' traversal: {v4a_path!r}. "
                     "Use the agent's cwd-relative path (no '..') or an absolute "
                     "path in '*** Update File:' / '*** Add File:' / "
-                    "'*** Delete File:' / '*** Move File:' headers."
+                    "'*** Delete File:' / '*** Move File:' headers.",
+                    "WORKSPACE_PATH_ESCAPE",
                 )
             return None
 
@@ -2452,26 +2495,26 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
-            return tool_error(sensitive_err)
+            return _write_tool_error(sensitive_err, "WORKSPACE_SENSITIVE_PATH")
         workspace_err = _enforce_within_workspace(_p, task_id)
         if workspace_err:
-            return tool_error(workspace_err)
+            return _write_tool_error(workspace_err, "WORKSPACE_PATH_ESCAPE")
         if not cross_profile:
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
-                return tool_error(cross_warning)
+                return _write_tool_error(cross_warning, "WORKSPACE_CROSS_PROFILE")
     for _p in _content_write_paths:
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
-            return tool_error(binary_doc_err)
+            return _write_tool_error(binary_doc_err, "WORKSPACE_BINARY_DOCUMENT")
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
     if protected_err:
-        return tool_error(protected_err)
+        return _write_tool_error(protected_err, "WORKSPACE_APPROVAL_DENIED")
     approval_err = _check_approval_required_write(_paths_to_check, task_id)
     if approval_err:
-        return tool_error(approval_err)
+        return _write_tool_error(approval_err, "WORKSPACE_APPROVAL_DENIED")
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -2519,9 +2562,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 
             if mode == "replace":
                 if not path:
-                    return tool_error("path required")
+                    return _write_tool_error("path required", "WORKSPACE_PARAM_INVALID")
                 if old_string is None or new_string is None:
-                    return tool_error("old_string and new_string required")
+                    return _write_tool_error("old_string and new_string required", "WORKSPACE_PARAM_INVALID")
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
                 # shell's own cwd may differ (worktree-cwd bug), and a relative
@@ -2531,7 +2574,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
-                    return tool_error("patch content required")
+                    return _write_tool_error("patch content required", "WORKSPACE_PARAM_INVALID")
                 # Rewrite V4A headers to the resolved absolute paths so the
                 # shell layer patches the exact files the tool layer resolved
                 # (locked/reported). Without this a relative header re-resolves
@@ -2542,9 +2585,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
                 result = file_ops.patch_v4a(patch_for_ops)
             else:
-                return tool_error(f"Unknown mode: {mode}")
+                return _write_tool_error(f"Unknown mode: {mode}", "WORKSPACE_PARAM_INVALID")
 
-            result_dict = result.to_dict()
+            result_dict = _stamp_write_error_code(result.to_dict())
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
@@ -2608,7 +2651,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return tool_error(str(e))
+        return _write_tool_error(str(e), "WORKSPACE_INTERNAL")
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",

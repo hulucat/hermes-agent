@@ -142,6 +142,41 @@ def test_extract_x_wm_tool_error_only_accepts_managed_envelope(result, expected)
     assert _extract_x_wm_tool_error(result) == expected
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # PATCH-027: 通用工具错误文本 + 阶段码过河(write_file/patch 失败信封)。
+        (
+            '{"error": "Path escapes allowed directory: ../x", "code": "WORKSPACE_PATH_ESCAPE"}',
+            {
+                "code": "WORKSPACE_PATH_ESCAPE",
+                "message": "Path escapes allowed directory: ../x",
+            },
+        ),
+        # 无 code 的纯文本错误 → HERMES_TOOL_ERROR 兜底码, 文本有界。
+        (
+            {"error": "[WinError 267] 目录名称无效。"},
+            {"code": "HERMES_TOOL_ERROR", "message": "[WinError 267] 目录名称无效。"},
+        ),
+        # 超长文本截断到 400 字符。
+        (
+            {"error": "x" * 500},
+            {"code": "HERMES_TOOL_ERROR", "message": "x" * 400},
+        ),
+        # 空/空白错误与非字符串错误不提取;非法 code 类型拒绝。
+        ({"error": "   "}, None),
+        ({"error": ""}, None),
+        ({"error": 123}, None),
+        ({"error": "text", "code": 7}, None),
+        ({"error": "text", "code": "  "}, None),
+        # 成功结果(带 ok:true)即便有 error 字符串也不提取。
+        ({"ok": True, "error": "nope"}, None),
+    ],
+)
+def test_extract_x_wm_tool_error_accepts_plain_tool_error_envelope(result, expected):
+    assert _extract_x_wm_tool_error(result) == expected
+
+
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
