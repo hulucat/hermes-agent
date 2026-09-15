@@ -781,6 +781,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
                     }
+                    # Preserve the env-var name alongside the resolved key.
+                    # Consumers re-read it for credential self-heal (401
+                    # refresh, per-turn env adoption); the legacy
+                    # custom_providers branch already passes it through.
+                    if key_env:
+                        result["key_env"] = key_env
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)

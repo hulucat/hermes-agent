@@ -71,6 +71,26 @@ def _patch_named_provider(monkeypatch, provider: dict | None):
     )
 
 
+def _patch_resolver_config(monkeypatch, config: dict, env_values: dict | None = None):
+    """Route the REAL ``_get_named_custom_provider`` at a synthetic config.
+
+    ``_patch_named_provider`` stubs the resolver wholesale, so it cannot see
+    shape drift between the resolver's return value and what the self-heal
+    consumes — the exact blind spot that shipped alpha47 (new-style
+    ``providers:`` entries resolved fine but dropped ``key_env``, silently
+    disarming the 401 recovery).
+    """
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(runtime_provider, "load_config", lambda: config)
+    if env_values is not None:
+        monkeypatch.setattr(
+            runtime_provider,
+            "_getenv",
+            lambda name, default="": env_values.get(name, default),
+        )
+
+
 _PROVIDER = {"key_env": KEY_ENV, "base_url": "https://upstream.example/v1"}
 
 
@@ -170,9 +190,107 @@ def test_refresh_skips_non_custom_or_missing_key_env(monkeypatch):
     agent.provider = "openai"
     assert agent._try_refresh_custom_provider_credentials() is False
 
+    # No key_env and nothing resolved to adopt — nothing to re-read.
     agent2, _ = _build_custom_agent()
     _patch_named_provider(monkeypatch, {"base_url": "https://upstream.example/v1"})
     assert agent2._try_refresh_custom_provider_credentials() is False
+
+    # No key_env, resolver-adopted key identical to the live client's.
+    agent3, _ = _build_custom_agent()
+    _patch_named_provider(
+        monkeypatch,
+        {"base_url": "https://upstream.example/v1", "api_key": "old-key"},
+    )
+    assert agent3._try_refresh_custom_provider_credentials() is False
+
+
+def test_refresh_falls_back_to_resolved_api_key_without_key_env(monkeypatch):
+    """alpha47 兜底:key_env 不可得时,解析出的新 key 仍须被采纳而非放弃。
+
+    长寿 gateway 的进程环境由 per-turn 重载刷新;resolver 无 key_env 可回读时,
+    与当前 client 的 key 比较、不同即换,可在 resolver 形状退化时继续自愈。
+    """
+    agent, calls = _build_custom_agent()
+    _patch_named_provider(
+        monkeypatch,
+        {"base_url": "https://upstream.example/v1", "api_key": "new-key"},
+    )
+
+    assert agent._try_refresh_custom_provider_credentials() is True
+    assert agent.api_key == "new-key"
+    assert calls["replace"] == ["custom_provider_credential_refresh"]
+
+
+def test_resolver_preserves_key_env_for_new_style_providers(monkeypatch):
+    """新式 ``providers:`` dict 形状必须回传 ``key_env``(alpha47 回归契约)。
+
+    该分支曾只回传解析后的 ``api_key`` 而丢弃变量名,令 401 自愈与 turn 边界
+    热采纳双双静默失效;WorkMate 的 ConfigTemplater 生成的正是这种形状。
+    """
+    _patch_resolver_config(
+        monkeypatch,
+        {
+            "providers": {
+                "upstream": {
+                    "api": "https://upstream.example/v1",
+                    "key_env": KEY_ENV,
+                }
+            }
+        },
+        {KEY_ENV: "resolved-key"},
+    )
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+    provider = _get_named_custom_provider("custom:upstream")
+    assert provider is not None
+    assert provider["key_env"] == KEY_ENV
+    assert provider["api_key"] == "resolved-key"
+    assert provider["base_url"] == "https://upstream.example/v1"
+
+
+def test_resolver_preserves_key_env_for_legacy_list(monkeypatch):
+    _patch_resolver_config(
+        monkeypatch,
+        {
+            "custom_providers": [
+                {
+                    "name": "upstream",
+                    "base_url": "https://upstream.example/v1",
+                    "key_env": KEY_ENV,
+                }
+            ]
+        },
+    )
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+    provider = _get_named_custom_provider("custom:upstream")
+    assert provider is not None
+    assert provider["key_env"] == KEY_ENV
+
+
+def test_self_heal_via_real_resolver_new_style_config(monkeypatch):
+    """端到端:新式 providers 配置走真实 resolver,401 自愈必须生效。
+
+    复现 alpha47 场景——agent 持旧 key(os.environ 时滞),.env 已被重签。
+    """
+    _patch_resolver_config(
+        monkeypatch,
+        {
+            "providers": {
+                "upstream": {
+                    "api": "https://upstream.example/v1",
+                    "key_env": KEY_ENV,
+                }
+            }
+        },
+        {KEY_ENV: "old-key"},
+    )
+    _patch_env(monkeypatch, {KEY_ENV: "new-key"})
+    agent, calls = _build_custom_agent()
+
+    assert agent._try_refresh_custom_provider_credentials() is True
+    assert agent.api_key == "new-key"
+    assert calls["replace"] == ["custom_provider_credential_refresh"]
 
 
 def test_status_code_from_value_maps_unauthorized():

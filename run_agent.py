@@ -6119,7 +6119,13 @@ class AIAgent:
         key_env = str(custom_provider.get("key_env") or "").strip()
         if not key_env:
             # Inline-key / pool-backed custom providers have no env-sourced
-            # credential to re-read.
+            # credential to re-read. The resolver still returns the key it
+            # resolved at lookup time (process env — per-turn reloaded in a
+            # long-lived gateway); when that diverges from the key this
+            # client was built with, adopting it beats surfacing the 401.
+            resolved_key = str(custom_provider.get("api_key") or "").strip()
+            if resolved_key and resolved_key != self.api_key:
+                return self._adopt_custom_provider_key(resolved_key)
             return False
 
         def _read_key() -> str:
