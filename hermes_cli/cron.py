@@ -244,15 +244,27 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             print(f"    {record['error']}")
 
 
-def cron_skip_missed(after: str) -> int:
+def cron_skip_missed(args) -> int:
     """Apply WorkMate's deliberate-stop no-catch-up policy."""
     from cron.jobs import skip_missed_jobs
 
+    after = args.after
+    older_than = getattr(args, "older_than", None)
+    as_json = getattr(args, "json", False)
     try:
-        result = skip_missed_jobs(after)
+        result = skip_missed_jobs(after, older_than_seconds=older_than)
     except ValueError as exc:
-        print(color(f"Failed to skip missed jobs: {exc}", Colors.RED))
+        if as_json:
+            # Machine-readable callers parse stdout; errors stay on stderr.
+            print(f"Failed to skip missed jobs: {exc}", file=sys.stderr)
+        else:
+            print(color(f"Failed to skip missed jobs: {exc}", Colors.RED))
         return 1
+    if as_json:
+        # ASCII-safe JSON only (default ensure_ascii): host-side subprocess
+        # decoding may use a locale codec (e.g. cp936).
+        print(json.dumps(result))
+        return 0
     print(
         color(
             "Skipped missed work: "
@@ -663,7 +675,7 @@ def cron_command(args):
         return 0
 
     if subcmd == "skip-missed":
-        return cron_skip_missed(args.after)
+        return cron_skip_missed(args)
 
     if subcmd == "notepad":
         return cron_notepad(args)

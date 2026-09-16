@@ -601,7 +601,13 @@ class TestSkipMissedJobs:
 
         result = skip_missed_jobs((now - timedelta(hours=1)).isoformat())
 
-        assert result == {"recurring": 1, "oneshot": 1, "total": 2}
+        assert result["recurring"] == 1
+        assert result["oneshot"] == 1
+        assert result["total"] == 2
+        assert {e["id"] for e in result["skipped"]} == {recurring["id"], oneshot["id"]}
+        for entry in result["skipped"]:
+            assert entry["due_at"] == (now - timedelta(minutes=10)).isoformat()
+        assert {e["kind"] for e in result["skipped"]} == {"interval", "once"}
         recurring_after = get_job(recurring["id"])
         assert recurring_after["enabled"] is True
         assert recurring_after["state"] == "scheduled"
@@ -612,14 +618,73 @@ class TestSkipMissedJobs:
         assert oneshot_after["state"] == "missed"
         assert oneshot_after["next_run_at"] is None
 
-        assert skip_missed_jobs((now - timedelta(hours=1)).isoformat()) == {
-            "recurring": 0,
-            "oneshot": 0,
-            "total": 0,
-        }
+        second = skip_missed_jobs((now - timedelta(hours=1)).isoformat())
+        assert second["recurring"] == 0
+        assert second["oneshot"] == 0
+        assert second["total"] == 0
+        assert second["skipped"] == []
         records = executions.list_executions(limit=10)
         assert len(records) == 2
         assert {record["status"] for record in records} == {"skipped"}
+
+    def test_older_than_gate_leaves_fresh_due_jobs_untouched(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """older_than 门控: 阈值内的 fresh-due job 不动, 只跳真陈旧的。"""
+        now = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        fresh = create_job(prompt="Fresh", schedule="every 1h")
+        stale = create_job(prompt="Stale", schedule="every 1h")
+        jobs = load_jobs()
+        fresh_due = (now - timedelta(seconds=30)).isoformat()
+        stale_due = (now - timedelta(hours=2)).isoformat()
+        for job in jobs:
+            job["next_run_at"] = (
+                fresh_due if job["id"] == fresh["id"] else stale_due
+            )
+        save_jobs(jobs)
+
+        result = skip_missed_jobs(
+            (now - timedelta(hours=3)).isoformat(), older_than_seconds=600
+        )
+
+        assert result["total"] == 1
+        assert result["skipped"] == [
+            {"id": stale["id"], "kind": "interval", "due_at": stale_due}
+        ]
+        fresh_after = get_job(fresh["id"])
+        assert fresh_after["next_run_at"] == fresh_due
+        assert "last_skipped_at" not in fresh_after
+        stale_after = get_job(stale["id"])
+        assert datetime.fromisoformat(stale_after["next_run_at"]) > now
+        assert stale_after["last_skipped_at"] == now.isoformat()
+
+    def test_older_than_gate_applies_to_one_shot_too(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        now = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        oneshot = create_job(prompt="Once", schedule="30m")
+        due = (now - timedelta(seconds=30)).isoformat()
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = due
+        save_jobs(jobs)
+
+        result = skip_missed_jobs(
+            (now - timedelta(hours=1)).isoformat(), older_than_seconds=600
+        )
+
+        assert result["total"] == 0
+        assert result["skipped"] == []
+        assert get_job(oneshot["id"])["next_run_at"] == due
+
+    def test_older_than_rejects_negative(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        with pytest.raises(ValueError, match="non-negative"):
+            skip_missed_jobs(
+                (now - timedelta(hours=1)).isoformat(), older_than_seconds=-1
+            )
 
     def test_rejects_future_after_without_writing(self, tmp_cron_dir, monkeypatch):
         now = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)

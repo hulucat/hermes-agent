@@ -239,6 +239,72 @@ def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):
     assert calls == [True]
 
 
+def test_cron_skip_missed_json_prints_receipt_only(monkeypatch, capsys):
+    import json as _json
+
+    receipt = {
+        "recurring": 1, "oneshot": 0, "total": 1,
+        "skipped": [{"id": "j1", "kind": "cron", "due_at": "2026-08-26T07:00:00+00:00"}],
+    }
+    captured = {}
+    monkeypatch.setattr(
+        "cron.jobs.skip_missed_jobs",
+        lambda after, older_than_seconds=None: captured.update(
+            after=after, older_than_seconds=older_than_seconds
+        )
+        or receipt,
+    )
+
+    rc = cron_cli.cron_skip_missed(
+        SimpleNamespace(
+            after="2026-08-26T06:00:00+00:00", older_than=600.0, json=True
+        )
+    )
+
+    assert rc == 0
+    assert captured == {
+        "after": "2026-08-26T06:00:00+00:00", "older_than_seconds": 600.0
+    }
+    out = capsys.readouterr().out
+    assert _json.loads(out) == receipt
+
+
+def test_cron_skip_missed_human_summary(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "cron.jobs.skip_missed_jobs",
+        lambda after, older_than_seconds=None: {
+            "recurring": 2, "oneshot": 1, "total": 3, "skipped": [],
+        },
+    )
+
+    rc = cron_cli.cron_skip_missed(
+        SimpleNamespace(after="2026-08-26T06:00:00+00:00", older_than=None, json=False)
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "2 recurring" in out
+    assert "1 one-shot" in out
+
+
+def test_cron_skip_missed_json_error_stays_on_stderr(monkeypatch, capsys):
+    def _boom(after, older_than_seconds=None):
+        raise ValueError("after must not be in the future")
+
+    monkeypatch.setattr("cron.jobs.skip_missed_jobs", _boom)
+
+    rc = cron_cli.cron_skip_missed(
+        SimpleNamespace(
+            after="2026-08-27T00:00:00+00:00", older_than=None, json=True
+        )
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "must not be in the future" in captured.err
+
+
 def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: {"success": False, "error": "boom"})
 

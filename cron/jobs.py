@@ -2311,14 +2311,30 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def skip_missed_jobs(after: str) -> Dict[str, int]:
-    """Advance work missed while WorkMate deliberately stopped the scheduler."""
+def skip_missed_jobs(
+    after: str, *, older_than_seconds: Optional[float] = None
+) -> Dict[str, Any]:
+    """Advance work missed while WorkMate deliberately stopped the scheduler.
+
+    Contract (WorkMate coupling, see PATCH-002): ``after`` participates ONLY in
+    the skip reason text and the future-validation check — the due decision is
+    ``due_at <= now`` over every enabled non-paused cron/interval/once job in
+    this profile's store. ``older_than_seconds`` is the only staleness gate:
+    when set, jobs overdue by that threshold or less are left untouched so a
+    live scheduler still fires them normally.
+
+    Returns counters plus a per-job receipt ``skipped`` list (``id``/``kind``/
+    ``due_at``, where ``due_at`` is the pre-advance ``next_run_at`` — the same
+    string used as the executions idempotency key).
+    """
     try:
         stopped_at = _ensure_aware(
             datetime.fromisoformat(str(after).replace("Z", "+00:00"))
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("after must be an ISO 8601 timestamp") from exc
+    if older_than_seconds is not None and older_than_seconds < 0:
+        raise ValueError("older_than_seconds must be non-negative")
 
     now = _hermes_now()
     if stopped_at > now:
@@ -2329,6 +2345,7 @@ def skip_missed_jobs(after: str) -> Dict[str, int]:
     )
     recurring = 0
     oneshot = 0
+    skipped: List[Dict[str, str]] = []
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2352,6 +2369,12 @@ def skip_missed_jobs(after: str) -> Dict[str, int]:
                 continue
             if due_at > now:
                 continue
+            if (
+                older_than_seconds is not None
+                and (now - due_at).total_seconds() <= older_than_seconds
+            ):
+                # Fresh-due: leave it for the scheduler to fire normally.
+                continue
 
             if kind in {"cron", "interval"}:
                 next_future = compute_next_run(schedule, now.isoformat())
@@ -2373,6 +2396,7 @@ def skip_missed_jobs(after: str) -> Dict[str, int]:
                     "missed_reason": reason,
                 })
                 oneshot += 1
+            skipped.append({"id": job["id"], "kind": kind, "due_at": next_run_at})
 
             from cron.executions import record_skipped_execution
 
@@ -2386,7 +2410,13 @@ def skip_missed_jobs(after: str) -> Dict[str, int]:
         if total:
             save_jobs(jobs)
 
-    return {"recurring": recurring, "oneshot": oneshot, "total": total}
+    total = recurring + oneshot
+    return {
+        "recurring": recurring,
+        "oneshot": oneshot,
+        "total": total,
+        "skipped": skipped,
+    }
 
 
 def remove_job(job_id: str) -> bool:
