@@ -2323,9 +2323,12 @@ def skip_missed_jobs(
     when set, jobs overdue by that threshold or less are left untouched so a
     live scheduler still fires them normally.
 
-    Returns counters plus a per-job receipt ``skipped`` list (``id``/``kind``/
+    Returns counters plus two per-job receipt lists (entries are ``id``/``kind``/
     ``due_at``, where ``due_at`` is the pre-advance ``next_run_at`` — the same
-    string used as the executions idempotency key).
+    string used as the executions idempotency key): ``skipped`` for jobs
+    advanced/terminalized here, and ``left_due`` for fresh-due jobs the
+    ``older_than_seconds`` gate left untouched so a live scheduler still fires
+    them (empty when the gate is not set).
     """
     try:
         stopped_at = _ensure_aware(
@@ -2346,6 +2349,7 @@ def skip_missed_jobs(
     recurring = 0
     oneshot = 0
     skipped: List[Dict[str, str]] = []
+    left_due: List[Dict[str, str]] = []
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2373,7 +2377,10 @@ def skip_missed_jobs(
                 older_than_seconds is not None
                 and (now - due_at).total_seconds() <= older_than_seconds
             ):
-                # Fresh-due: leave it for the scheduler to fire normally.
+                # Fresh-due: leave it for the scheduler to fire normally. Report
+                # it in the receipt so the host can protect the slot (skip its
+                # schedule rewrite / resume for this activation cycle).
+                left_due.append({"id": job["id"], "kind": kind, "due_at": next_run_at})
                 continue
 
             if kind in {"cron", "interval"}:
@@ -2410,12 +2417,12 @@ def skip_missed_jobs(
         if total:
             save_jobs(jobs)
 
-    total = recurring + oneshot
     return {
         "recurring": recurring,
         "oneshot": oneshot,
         "total": total,
         "skipped": skipped,
+        "left_due": left_due,
     }
 
 

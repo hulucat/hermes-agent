@@ -74,8 +74,9 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 _WM_REQUEST_ID_FIELD = "x_wm_request_id"
 _WM_ERROR_FIELD = "x_wm_error"
 _WM_TOOL_ERROR_CODE_PREFIX = "PYTHON_COMPUTE_"
-# Upper bound for the generic tool-error text carried in x_wm_error. Applied
-# AFTER redaction so a redaction sentinel is never sliced mid-way.
+# Upper bound for the generic tool-error text carried in x_wm_error. Redaction
+# runs BEFORE the bound so secrets never ride the tail; a redaction sentinel
+# may still be sliced mid-way — cosmetic only, no plaintext leaks.
 _WM_TOOL_ERROR_TEXT_MAX = 400
 _WM_SESSION_APPROVAL_CATEGORIES = frozenset(
     {"workspace_write", "python_compute", "publish_artifact"}
@@ -143,7 +144,8 @@ def _extract_x_wm_tool_error(raw_result: object) -> Optional[Dict[str, str]]:
     * Generic tool errors: ``{"error": "<text>", "code": "<WORKSPACE_*>"}`` —
       e.g. write_file/patch stage codes. Without a code the text still rides
       as ``HERMES_TOOL_ERROR`` (bounded) so the host failure envelope stops
-      collapsing to a boolean; unknown codes are validated host-side.
+      collapsing to a boolean; unknown codes are normalized host-side to
+      ``HERMES_TOOL_ERROR`` (message preserved).
     """
     if isinstance(raw_result, str):
         try:

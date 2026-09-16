@@ -623,6 +623,9 @@ class TestSkipMissedJobs:
         assert second["oneshot"] == 0
         assert second["total"] == 0
         assert second["skipped"] == []
+        assert second["left_due"] == []
+        # 无门控的首跑: 门控未设, 一切 due 都跳过, left_due 恒空。
+        assert result["left_due"] == []
         records = executions.list_executions(limit=10)
         assert len(records) == 2
         assert {record["status"] for record in records} == {"skipped"}
@@ -652,6 +655,9 @@ class TestSkipMissedJobs:
         assert result["skipped"] == [
             {"id": stale["id"], "kind": "interval", "due_at": stale_due}
         ]
+        assert result["left_due"] == [
+            {"id": fresh["id"], "kind": "interval", "due_at": fresh_due}
+        ]
         fresh_after = get_job(fresh["id"])
         assert fresh_after["next_run_at"] == fresh_due
         assert "last_skipped_at" not in fresh_after
@@ -676,6 +682,9 @@ class TestSkipMissedJobs:
 
         assert result["total"] == 0
         assert result["skipped"] == []
+        assert result["left_due"] == [
+            {"id": oneshot["id"], "kind": "once", "due_at": due}
+        ]
         assert get_job(oneshot["id"])["next_run_at"] == due
 
     def test_older_than_rejects_negative(self, tmp_cron_dir, monkeypatch):
