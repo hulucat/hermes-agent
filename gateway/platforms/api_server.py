@@ -74,6 +74,9 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 _WM_REQUEST_ID_FIELD = "x_wm_request_id"
 _WM_ERROR_FIELD = "x_wm_error"
 _WM_TOOL_ERROR_CODE_PREFIX = "PYTHON_COMPUTE_"
+# Upper bound for the generic tool-error text carried in x_wm_error. Applied
+# AFTER redaction so a redaction sentinel is never sliced mid-way.
+_WM_TOOL_ERROR_TEXT_MAX = 400
 _WM_SESSION_APPROVAL_CATEGORIES = frozenset(
     {"workspace_write", "python_compute", "publish_artifact"}
 )
@@ -156,7 +159,9 @@ def _extract_x_wm_tool_error(raw_result: object) -> Optional[Dict[str, str]]:
             return None
         # PATCH-027: plain tool-error envelope ({"error": str, "code"?}) —
         # no ``ok`` marker. Only strings qualify; dict errors keep the
-        # managed path below.
+        # managed path below. The text is arbitrary tool output (terminal,
+        # MCP, web_extract…), so it rides the same forced redaction as the
+        # reasoning previews before the length bound.
         error = payload.get("error")
         if not isinstance(error, str) or not error.strip():
             return None
@@ -165,7 +170,9 @@ def _extract_x_wm_tool_error(raw_result: object) -> Optional[Dict[str, str]]:
             return None
         return {
             "code": (code or "HERMES_TOOL_ERROR").strip(),
-            "message": error[:400],
+            "message": redact_sensitive_text(error, force=True)[
+                :_WM_TOOL_ERROR_TEXT_MAX
+            ],
         }
     error = payload.get("error")
     if not isinstance(error, dict):

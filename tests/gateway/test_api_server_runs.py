@@ -33,6 +33,8 @@ from gateway.platforms.api_server import (
 )
 from tools import approval as approval_mod
 
+from agent.redact import redact_sensitive_text
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -175,6 +177,24 @@ def test_extract_x_wm_tool_error_only_accepts_managed_envelope(result, expected)
 )
 def test_extract_x_wm_tool_error_accepts_plain_tool_error_envelope(result, expected):
     assert _extract_x_wm_tool_error(result) == expected
+
+
+def test_extract_x_wm_tool_error_redacts_generic_branch():
+    """通用分支的自由文本先脱敏再截断(高优评审: 出域面与 reasoning preview 同规)。"""
+    bearer = "Authorization: Bearer ghp_0123456789abcdefghijklmnopqrstuv failed"
+    extracted = _extract_x_wm_tool_error({"error": bearer})
+    assert extracted is not None
+    assert "ghp_0123456789abcdefghijklmnopqrstuv" not in extracted["message"]
+    assert extracted["message"] == redact_sensitive_text(bearer, force=True)
+
+    dsn = "connect postgres://user:secretpw@db.internal/x failed"
+    extracted = _extract_x_wm_tool_error(
+        {"error": dsn, "code": "WORKSPACE_INTERNAL"}
+    )
+    assert extracted is not None
+    assert extracted["code"] == "WORKSPACE_INTERNAL"
+    assert "secretpw" not in extracted["message"]
+    assert extracted["message"] == redact_sensitive_text(dsn, force=True)
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
