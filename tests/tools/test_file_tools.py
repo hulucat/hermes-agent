@@ -1055,3 +1055,50 @@ class TestWorkspaceWriteErrorCodes:
         success = {"status": "ok"}
         _stamp_write_error_code(success)
         assert "code" not in success
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_tool_shell_failure_carries_stage_code(self, mock_get):
+        """工具入口端到端: shell 层写入失败 → 失败信封带阶段码(评审覆盖缺口)。"""
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "error": "Write denied: '/etc/x' is outside HERMES_WRITE_SAFE_ROOT"
+        }
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        payload = json.loads(write_file_tool("/etc/x", "data"))
+        assert payload["code"] == "WORKSPACE_WRITE_DENIED"
+        assert payload["error"].startswith("Write denied:")
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_tool_shell_failure_carries_stage_code(self, mock_get, tmp_path):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "error": "Failed to write file: mkdir: cannot create directory '/a/b'"
+        }
+        mock_ops.patch_replace.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        target = tmp_path / "target.txt"
+        target.write_text("old", encoding="utf-8")
+        from tools.file_tools import patch_tool
+        payload = json.loads(
+            patch_tool(mode="replace", path=str(target), old_string="old", new_string="new")
+        )
+        assert payload["code"] == "WORKSPACE_ATOMIC_WRITE"
+        assert payload["error"].startswith("Failed to write file:")
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_tool_success_carries_no_code(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok", "path": "/tmp/out.txt"}
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        payload = json.loads(write_file_tool("/tmp/out.txt", "data"))
+        assert "code" not in payload

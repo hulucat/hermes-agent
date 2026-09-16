@@ -2380,12 +2380,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
+            _stamp_write_error_code(result_dict)
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             if not result_dict.get("error"):
                 _mark_verification_stale(task_id, [path], session_id=session_id)
-            else:
-                _stamp_write_error_code(result_dict)
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -2403,6 +2402,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
+            _stamp_write_error_code(result_dict)
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning
@@ -2418,8 +2418,6 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
-            else:
-                _stamp_write_error_code(result_dict)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
