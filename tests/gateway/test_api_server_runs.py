@@ -33,6 +33,8 @@ from gateway.platforms.api_server import (
 )
 from tools import approval as approval_mod
 
+from agent.redact import redact_sensitive_text
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -140,6 +142,59 @@ def test_extract_x_wm_request_id_accepts_one_canonical_uuid4(result, expected):
 def test_extract_x_wm_tool_error_only_accepts_managed_envelope(result, expected):
     # dict 直接传入;字符串走 JSON 解析路径("not-json" 覆盖解析失败)。
     assert _extract_x_wm_tool_error(result) == expected
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # PATCH-027: 通用工具错误文本 + 阶段码过河(write_file/patch 失败信封)。
+        (
+            '{"error": "Path escapes allowed directory: ../x", "code": "WORKSPACE_PATH_ESCAPE"}',
+            {
+                "code": "WORKSPACE_PATH_ESCAPE",
+                "message": "Path escapes allowed directory: ../x",
+            },
+        ),
+        # 无 code 的纯文本错误 → HERMES_TOOL_ERROR 兜底码, 文本有界。
+        (
+            {"error": "[WinError 267] 目录名称无效。"},
+            {"code": "HERMES_TOOL_ERROR", "message": "[WinError 267] 目录名称无效。"},
+        ),
+        # 超长文本截断到 400 字符。
+        (
+            {"error": "x" * 500},
+            {"code": "HERMES_TOOL_ERROR", "message": "x" * 400},
+        ),
+        # 空/空白错误与非字符串错误不提取;非法 code 类型拒绝。
+        ({"error": "   "}, None),
+        ({"error": ""}, None),
+        ({"error": 123}, None),
+        ({"error": "text", "code": 7}, None),
+        ({"error": "text", "code": "  "}, None),
+        # 成功结果(带 ok:true)即便有 error 字符串也不提取。
+        ({"ok": True, "error": "nope"}, None),
+    ],
+)
+def test_extract_x_wm_tool_error_accepts_plain_tool_error_envelope(result, expected):
+    assert _extract_x_wm_tool_error(result) == expected
+
+
+def test_extract_x_wm_tool_error_redacts_generic_branch():
+    """通用分支的自由文本先脱敏再截断(高优评审: 出域面与 reasoning preview 同规)。"""
+    bearer = "Authorization: Bearer ghp_0123456789abcdefghijklmnopqrstuv failed"
+    extracted = _extract_x_wm_tool_error({"error": bearer})
+    assert extracted is not None
+    assert "ghp_0123456789abcdefghijklmnopqrstuv" not in extracted["message"]
+    assert extracted["message"] == redact_sensitive_text(bearer, force=True)
+
+    dsn = "connect postgres://user:secretpw@db.internal/x failed"
+    extracted = _extract_x_wm_tool_error(
+        {"error": dsn, "code": "WORKSPACE_INTERNAL"}
+    )
+    assert extracted is not None
+    assert extracted["code"] == "WORKSPACE_INTERNAL"
+    assert "secretpw" not in extracted["message"]
+    assert extracted["message"] == redact_sensitive_text(dsn, force=True)
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:

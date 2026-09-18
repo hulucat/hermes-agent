@@ -1005,3 +1005,100 @@ class TestNotFoundCache:
         assert _check_not_found_cache("read", "/tmp/never-exists-notify", tid) is None, (
             "notify_other_tool_call must clear cached misses"
         )
+
+
+class TestWorkspaceWriteErrorCodes:
+    """PATCH-027: write_file/patch 失败信封携带稳定阶段码, 供 WorkMate 侧消费。"""
+
+    def test_shell_write_error_code_prefix_mapping(self):
+        from tools.file_tools import _shell_write_error_code
+
+        assert _shell_write_error_code(
+            "Write denied: '/x' is outside HERMES_WRITE_SAFE_ROOT"
+        ) == "WORKSPACE_WRITE_DENIED"
+        assert _shell_write_error_code(
+            "Failed to write file: mkdir: cannot create directory '/a/b'"
+        ) == "WORKSPACE_ATOMIC_WRITE"
+        assert _shell_write_error_code(
+            "Post-write verification failed for /x: on-disk content hash differs"
+        ) == "WORKSPACE_POST_VERIFY"
+        assert _shell_write_error_code(
+            "Refusing to write '/x.py': candidate content fails py syntax validation (err)"
+        ) == "WORKSPACE_VALIDATION"
+        assert _shell_write_error_code("[WinError 267] 目录名称无效。") == "WORKSPACE_INTERNAL"
+        assert _shell_write_error_code("") == "WORKSPACE_INTERNAL"
+
+    def test_write_tool_error_envelope_carries_code(self):
+        from tools.file_tools import _write_tool_error
+
+        payload = json.loads(_write_tool_error("boom", "WORKSPACE_INTERNAL"))
+        assert payload["error"] == "boom"
+        assert payload["code"] == "WORKSPACE_INTERNAL"
+
+    def test_patch_param_errors_carry_stage_code(self):
+        from tools.file_tools import patch_tool
+
+        payload = json.loads(patch_tool(mode="replace", old_string="a", new_string="b"))
+        assert payload["error"] == "path required"
+        assert payload["code"] == "WORKSPACE_PARAM_INVALID"
+
+        payload = json.loads(patch_tool(mode="nonsense"))
+        assert payload["code"] == "WORKSPACE_PARAM_INVALID"
+
+    def test_shell_result_failure_is_stamped(self):
+        from tools.file_tools import _stamp_write_error_code
+
+        failure = {"error": "Write denied: '/etc/x' is a protected system file."}
+        _stamp_write_error_code(failure)
+        assert failure["code"] == "WORKSPACE_WRITE_DENIED"
+
+        success = {"status": "ok"}
+        _stamp_write_error_code(success)
+        assert "code" not in success
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_tool_shell_failure_carries_stage_code(self, mock_get):
+        """工具入口端到端: shell 层写入失败 → 失败信封带阶段码(评审覆盖缺口)。"""
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "error": "Write denied: '/etc/x' is outside HERMES_WRITE_SAFE_ROOT"
+        }
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        payload = json.loads(write_file_tool("/etc/x", "data"))
+        assert payload["code"] == "WORKSPACE_WRITE_DENIED"
+        assert payload["error"].startswith("Write denied:")
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_tool_shell_failure_carries_stage_code(self, mock_get, tmp_path):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "error": "Failed to write file: mkdir: cannot create directory '/a/b'"
+        }
+        mock_ops.patch_replace.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        target = tmp_path / "target.txt"
+        target.write_text("old", encoding="utf-8")
+        from tools.file_tools import patch_tool
+        payload = json.loads(
+            patch_tool(mode="replace", path=str(target), old_string="old", new_string="new")
+        )
+        assert payload["code"] == "WORKSPACE_ATOMIC_WRITE"
+        assert payload["error"].startswith("Failed to write file:")
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_tool_success_carries_no_code(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok", "path": "/tmp/out.txt"}
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        payload = json.loads(write_file_tool("/tmp/out.txt", "data"))
+        assert "code" not in payload

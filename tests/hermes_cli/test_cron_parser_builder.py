@@ -33,6 +33,24 @@ def test_cron_subactions_present():
         assert ns.cron_command == action
 
 
+def test_cron_skip_missed_flags():
+    parser = _build()
+    ns = parser.parse_args(
+        ["cron", "skip-missed", "--after", "2026-08-26T08:00:00+00:00"]
+    )
+    assert ns.after == "2026-08-26T08:00:00+00:00"
+    assert ns.older_than is None
+    assert ns.json is False
+    ns2 = parser.parse_args(
+        [
+            "cron", "skip-missed", "--after", "2026-08-26T08:00:00+00:00",
+            "--older-than", "600", "--json",
+        ]
+    )
+    assert ns2.older_than == 600.0
+    assert ns2.json is True
+
+
 def test_cron_edit_no_agent_tristate():
     parser = _build()
     # --no-agent -> True, --agent -> False, neither -> None

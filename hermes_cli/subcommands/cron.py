@@ -287,6 +287,20 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         required=True,
         help="ISO 8601 timestamp at which the scheduler was deliberately stopped",
     )
+    cron_skip_missed.add_argument(
+        "--older-than",
+        dest="older_than",
+        type=float,
+        default=None,
+        help="Only skip jobs overdue by MORE than this many seconds; "
+        "fresh-due jobs are left to fire normally",
+    )
+    cron_skip_missed.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Print only the machine-readable receipt dict on stdout",
+    )
 
     # cron notepad — per-job durable KV scratchpad (injected into the job
     # prompt each run; the running agent writes it via this CLI).
